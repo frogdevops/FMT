@@ -8,3 +8,5 @@ mod real_runtime;
 mod win;
 #[cfg(target_os = "windows")]
 mod entry;
+#[cfg(target_os = "windows")]
+mod mem_scan;

@@ -13,6 +13,7 @@ use agent_core::respect::should_decline;
 use windows_sys::Win32::Foundation::{BOOL, HANDLE, HMODULE, TRUE};
 
 use crate::il2cpp_ffi::Il2CppApi;
+use crate::mem_scan::{scan_metadata_candidates, scan_process_for_metadata};
 use crate::real_runtime::RealRuntime;
 use crate::win::loaded_module_names;
 
@@ -228,6 +229,38 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         return 0;
     }
     log("respect gate passed");
+
+    // One-shot struct-layout recon for the pointer-chasing approach (read-only).
+    log("=== struct layout diagnostic ===");
+    for line in unsafe { crate::il2cpp_ffi::dump_struct_diagnostics() } {
+        log(&line);
+    }
+    log("=== end struct layout diagnostic ===");
+
+    // Primary path: read the decrypted metadata directly from memory. Read-only,
+    // crash-safe, handles obfuscated games. Returns None until a real layout is
+    // registered or if no blob is present — in which case we fall through to the
+    // safe standard-export path below.
+    let candidates = scan_metadata_candidates();
+    log(&format!("metadata magic candidates in memory: {}", candidates.len()));
+    for (addr, version) in candidates.iter().take(32) {
+        log(&format!("  candidate @ {:#x} version={}", addr, version));
+    }
+    log("scanning memory for global-metadata...");
+    if let Some(dump) = scan_process_for_metadata() {
+        log(&format!(
+            "metadata scan: {} classes, {} fields",
+            dump.class_count(),
+            dump.total_fields()
+        ));
+        let text = format_dump(&dump);
+        match write_text(&dump_path(), &text) {
+            Ok(()) => log("wrote internals.txt (from metadata scan)"),
+            Err(e) => log(&format!("failed to write internals.txt: {}", e)),
+        }
+        return 0;
+    }
+    log("metadata scan found nothing; trying standard il2cpp exports");
 
     let api = unsafe {
         let mut attempts = 0;

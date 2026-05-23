@@ -51,6 +51,7 @@ unsafe fn resolve(
     proc.map(|p| p as *const c_void)
 }
 
+#[allow(dead_code)]
 struct ExportedFunc {
     name: String,
     _rva: u32,
@@ -59,6 +60,7 @@ struct ExportedFunc {
 }
 
 /// Dynamic signature scanner for resolving scrambled/obfuscated exports.
+#[allow(dead_code)]
 unsafe fn resolve_scrambled_exports(
     module: windows_sys::Win32::Foundation::HMODULE,
 ) -> Option<Il2CppApi> {
@@ -326,12 +328,11 @@ impl Il2CppApi {
             })
         };
 
-        if let Some(api) = resolve_std() {
-            return Some(api);
-        }
-
-        // Fallback to signature/scrambled export resolution
-        resolve_scrambled_exports(module)
+        // Only the stable standard exports are used. The signature-scanner is
+        // retired from the resolution path: calling a mis-resolved obfuscated
+        // function crashes the game (uncatchable). Obfuscated games are handled
+        // by the read-only metadata memory-scan (mem_scan) instead.
+        resolve_std()
     }
 }
 
@@ -391,4 +392,85 @@ pub unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     let bytes = std::slice::from_raw_parts(ptr as *const u8, avail);
     let len = bytes.iter().position(|&b| b == 0).unwrap_or(avail);
     String::from_utf8_lossy(&bytes[..len]).into_owned()
+}
+
+unsafe fn hex_dump(ptr: *const u8, len: usize) -> String {
+    if !mem_readable(ptr, len) {
+        return "<unreadable>".to_string();
+    }
+    let slice = std::slice::from_raw_parts(ptr, len);
+    let mut s = String::with_capacity(len * 3);
+    for (i, b) in slice.iter().enumerate() {
+        if i > 0 && i % 16 == 0 {
+            s.push_str("| ");
+        }
+        s.push_str(&format!("{:02X} ", b));
+    }
+    s
+}
+
+/// One-shot recon: walk domain -> assemblies[0] -> image using ONLY the
+/// reliably-resolved getters (all proven safe), and hex-dump the domain and
+/// image structs so their layout can be analyzed offline. Never calls the
+/// crash-prone accessors (image_get_class / class_get_* / field_*).
+pub unsafe fn dump_struct_diagnostics() -> Vec<String> {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let mut out = Vec::new();
+
+    // GameAssembly.dll isn't mapped at process start — poll for it (up to 60s).
+    let mut module = GetModuleHandleA(b"GameAssembly.dll\0".as_ptr());
+    let mut attempts = 0;
+    while module.is_null() {
+        attempts += 1;
+        if attempts > 600 {
+            out.push("GameAssembly.dll never loaded (waited 60s)".to_string());
+            return out;
+        }
+        sleep(Duration::from_millis(100));
+        module = GetModuleHandleA(b"GameAssembly.dll\0".as_ptr());
+    }
+
+    // Resolve the (obfuscated) exports — export table is present once mapped.
+    let api = match resolve_scrambled_exports(module) {
+        Some(a) => a,
+        None => {
+            out.push("resolve_scrambled_exports failed (could not anchor)".to_string());
+            return out;
+        }
+    };
+
+    // Wait for the il2cpp domain to be initialized (domain_get returns null until init).
+    let mut domain = (api.domain_get)();
+    let mut dattempts = 0;
+    while domain.is_null() {
+        dattempts += 1;
+        if dattempts > 600 {
+            out.push("il2cpp domain never initialized (waited 60s)".to_string());
+            return out;
+        }
+        sleep(Duration::from_millis(100));
+        domain = (api.domain_get)();
+    }
+
+    out.push(format!("domain = {:p}", domain));
+    out.push(format!("domain[0x00..0x80]: {}", hex_dump(domain as *const u8, 0x80)));
+
+    let mut count: usize = 0;
+    let assemblies = (api.domain_get_assemblies)(domain, &mut count);
+    out.push(format!("assemblies = {:p}, count = {}", assemblies, count));
+    if assemblies.is_null() || count == 0 {
+        return out;
+    }
+
+    let asm = *assemblies; // first assembly
+    let image = (api.assembly_get_image)(asm);
+    let name = cstr_to_string((api.image_get_name)(image));
+    out.push(format!(
+        "assembly[0] = {:p}, image = {:p}, name = '{}'",
+        asm, image, name
+    ));
+    out.push(format!("image[0x00..0x100]: {}", hex_dump(image as *const u8, 0x100)));
+    out
 }

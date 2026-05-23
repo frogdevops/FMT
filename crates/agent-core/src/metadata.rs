@@ -161,6 +161,43 @@ pub fn find_magic_offsets(bytes: &[u8]) -> Vec<usize> {
         .collect()
 }
 
+/// Scan `bytes` for metadata-magic candidates and return the first that parses
+/// into a non-empty `Dump`. `layout_for` maps a metadata version (the u32 at the
+/// candidate's byte offset +4) to its layout; candidates whose version is
+/// unsupported or whose blob fails validation are skipped.
+pub fn find_and_parse(
+    bytes: &[u8],
+    layout_for: impl Fn(u32) -> Option<MetadataLayout>,
+) -> Option<Dump> {
+    for off in find_magic_offsets(bytes) {
+        let version = match read_u32(bytes, off + 4) {
+            Some(v) => v,
+            None => continue,
+        };
+        let layout = match layout_for(version) {
+            Some(l) => l,
+            None => continue,
+        };
+        if let Some(dump) = parse_metadata(&bytes[off..], &layout) {
+            if !dump.classes.is_empty() {
+                return Some(dump);
+            }
+        }
+    }
+    None
+}
+
+/// Map a metadata version number to its byte layout. Real layouts are filled in
+/// later (transcribed from Il2CppDumper); until then this returns `None`, so the
+/// scanner finds nothing rather than misparsing. Add `29 => Some(LAYOUT_V29),`
+/// etc. as each layout lands.
+pub fn layout_for_version(_version: u32) -> Option<MetadataLayout> {
+    match _version {
+        // 29 => Some(LAYOUT_V29),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) const TEST_LAYOUT: MetadataLayout = MetadataLayout {
     h_string_offset: 8,
@@ -292,5 +329,25 @@ mod tests {
         data.extend_from_slice(&METADATA_MAGIC.to_le_bytes());
         assert_eq!(find_magic_offsets(&data), vec![10, 17]);
         assert_eq!(find_magic_offsets(&[0u8; 4]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn find_and_parse_locates_embedded_blob() {
+        let mut region = vec![0u8; 16];
+        region.extend_from_slice(&test_blob());
+        let dump = find_and_parse(&region, |v| if v == 29 { Some(TEST_LAYOUT) } else { None }).unwrap();
+        assert_eq!(dump.classes.len(), 1);
+        assert_eq!(dump.classes[0].name, "Player");
+    }
+
+    #[test]
+    fn find_and_parse_returns_none_without_magic() {
+        let region = vec![0u8; 256];
+        assert!(find_and_parse(&region, |_| Some(TEST_LAYOUT)).is_none());
+    }
+
+    #[test]
+    fn layout_for_unknown_version_is_none() {
+        assert!(layout_for_version(9999).is_none());
     }
 }
