@@ -13,7 +13,7 @@ use agent_core::respect::should_decline;
 use windows_sys::Win32::Foundation::{BOOL, HANDLE, HMODULE, TRUE};
 
 use crate::il2cpp_ffi::Il2CppApi;
-use crate::mem_scan::{scan_gameassembly_for_strings, scan_metadata_candidates, scan_process_for_metadata};
+use crate::mem_scan::{scan_for_classes, scan_gameassembly_for_strings, scan_metadata_candidates, scan_process_for_metadata};
 use crate::real_runtime::RealRuntime;
 use crate::win::loaded_module_names;
 
@@ -250,6 +250,44 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         }
     }
     log("=== end string anchor scan ===");
+
+    // Structural scan for the class table (s_TypeInfoTable) — read-only. Finds a
+    // run of consecutive pointers to Il2CppClass-shaped structs and reads their
+    // names. No exports called, no hardcoded names; every deref is in_region-gated.
+    log("=== class table scan (looping ~3min; ENTER A WORLD to load gameplay classes) ===");
+    {
+        use std::collections::HashSet;
+        const PASSES: usize = 36;
+        const INTERVAL_MS: u64 = 5000;
+        let mut seen: HashSet<String> = HashSet::new();
+        for pass in 1..=PASSES {
+            let classes = scan_for_classes(8000);
+            let mut new_this_pass: Vec<String> = Vec::new();
+            for (name, ns) in &classes {
+                let full = if ns.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}::{}", ns, name)
+                };
+                if seen.insert(full.clone()) {
+                    new_this_pass.push(full);
+                }
+            }
+            log(&format!(
+                "  pass {}/{}: total={}, new={}",
+                pass,
+                PASSES,
+                classes.len(),
+                new_this_pass.len()
+            ));
+            for full in new_this_pass.iter().take(150) {
+                log(&format!("    + {}", full));
+            }
+            std::thread::sleep(Duration::from_millis(INTERVAL_MS));
+        }
+    }
+    log("=== end class table scan ===");
+    return 0;
 
     // Diagnostic build: the blind full-process blob scans are removed here. We
     // established scanning for the decrypted blob is futile on this target (we

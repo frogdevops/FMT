@@ -472,5 +472,36 @@ pub unsafe fn dump_struct_diagnostics() -> Vec<String> {
         asm, image, name
     ));
     out.push(format!("image[0x00..0x100]: {}", hex_dump(image as *const u8, 0x100)));
+
+    // Bytecode of the resolved accessors — their machine code encodes the struct
+    // offsets they read (e.g. `mov rax,[rcx+0x10]; ret`), and image_get_class's
+    // code reveals how it reaches the class table. Read-only.
+    out.push("--- accessor bytecode (first 32 bytes) ---".to_string());
+    let dump_fn = |name: &str, p: usize, out: &mut Vec<String>| {
+        let ptr = p as *const u8;
+        out.push(format!("{:<22} @ {:#x}: {}", name, p, hex_dump(ptr, 32)));
+    };
+    dump_fn("image_get_class_count", api.image_get_class_count as usize, &mut out);
+    dump_fn("image_get_class", api.image_get_class as usize, &mut out);
+    dump_fn("class_get_name", api.class_get_name as usize, &mut out);
+    dump_fn("class_get_namespace", api.class_get_namespace as usize, &mut out);
+    dump_fn("class_get_fields", api.class_get_fields as usize, &mut out);
+    dump_fn("field_get_name", api.field_get_name as usize, &mut out);
+    dump_fn("field_get_type", api.field_get_type as usize, &mut out);
+    dump_fn("type_get_name", api.type_get_name as usize, &mut out);
+    dump_fn("image_get_name", api.image_get_name as usize, &mut out);
+    dump_fn("assembly_get_image", api.assembly_get_image as usize, &mut out);
+
+    // Follow the pointer at image+0x28 (the one image field we haven't chased).
+    let p28_addr = image as usize + 0x28;
+    if mem_readable(p28_addr as *const u8, 8) {
+        let p28 = *(p28_addr as *const usize);
+        out.push(format!(
+            "image+0x28 -> {:#x}: {}",
+            p28,
+            hex_dump(p28 as *const u8, 0x80)
+        ));
+    }
+
     out
 }
