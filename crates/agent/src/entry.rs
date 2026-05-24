@@ -13,7 +13,7 @@ use agent_core::respect::should_decline;
 use windows_sys::Win32::Foundation::{BOOL, HANDLE, HMODULE, TRUE};
 
 use crate::il2cpp_ffi::Il2CppApi;
-use crate::mem_scan::{scan_for_classes, scan_gameassembly_for_strings, scan_metadata_candidates, scan_process_for_metadata};
+use crate::mem_scan::{find_class_table, read_class_table, scan_gameassembly_for_strings, scan_metadata_candidates, scan_process_for_metadata};
 use crate::real_runtime::RealRuntime;
 use crate::win::loaded_module_names;
 
@@ -254,39 +254,56 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     // Structural scan for the class table (s_TypeInfoTable) — read-only. Finds a
     // run of consecutive pointers to Il2CppClass-shaped structs and reads their
     // names. No exports called, no hardcoded names; every deref is in_region-gated.
-    log("=== class table scan (looping ~3min; ENTER A WORLD to load gameplay classes) ===");
+    log("=== PULL TEST: locate table once, then watch it (1s poll) — ENTER A WORLD ===");
     {
         use std::collections::HashSet;
-        const PASSES: usize = 36;
-        const INTERVAL_MS: u64 = 5000;
-        let mut seen: HashSet<String> = HashSet::new();
-        for pass in 1..=PASSES {
-            let classes = scan_for_classes(8000);
-            let mut new_this_pass: Vec<String> = Vec::new();
-            for (name, ns) in &classes {
-                let full = if ns.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{}::{}", ns, name)
-                };
-                if seen.insert(full.clone()) {
-                    new_this_pass.push(full);
+        // Phase 1a: locate s_TypeInfoTable once, retrying while it first populates.
+        let mut table: Option<(usize, usize)> = None;
+        for _ in 0..30 {
+            if let Some(t) = find_class_table() {
+                table = Some(t);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        match table {
+            None => log("  FAILED to locate class table (needs sub-phase 1a)"),
+            Some((base, count)) => {
+                log(&format!("  located table @ {:#x}, {} slots", base, count));
+                // Phase 1b: watch — re-read ONLY the table each tick and diff.
+                let mut seen: HashSet<String> = HashSet::new();
+                const PASSES: usize = 60;
+                const INTERVAL_MS: u64 = 1000;
+                for pass in 1..=PASSES {
+                    let classes = read_class_table(base, count);
+                    let mut new_count = 0usize;
+                    let mut sample: Vec<String> = Vec::new();
+                    for (name, ns) in &classes {
+                        let full = if ns.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}::{}", ns, name)
+                        };
+                        if seen.insert(full.clone()) {
+                            new_count += 1;
+                            if sample.len() < 40 {
+                                sample.push(full);
+                            }
+                        }
+                    }
+                    log(&format!(
+                        "  pass {}/{}: live={}, new={}",
+                        pass, PASSES, classes.len(), new_count
+                    ));
+                    for full in &sample {
+                        log(&format!("    + {}", full));
+                    }
+                    std::thread::sleep(Duration::from_millis(INTERVAL_MS));
                 }
             }
-            log(&format!(
-                "  pass {}/{}: total={}, new={}",
-                pass,
-                PASSES,
-                classes.len(),
-                new_this_pass.len()
-            ));
-            for full in new_this_pass.iter().take(150) {
-                log(&format!("    + {}", full));
-            }
-            std::thread::sleep(Duration::from_millis(INTERVAL_MS));
         }
     }
-    log("=== end class table scan ===");
+    log("=== end PULL TEST ===");
     return 0;
 
     // Diagnostic build: the blind full-process blob scans are removed here. We

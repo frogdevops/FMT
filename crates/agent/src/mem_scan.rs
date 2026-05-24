@@ -396,3 +396,206 @@ pub fn scan_for_strings(needles: &[&str]) -> Vec<(String, usize)> {
     }
     out
 }
+
+/// A snapshot of committed, readable memory regions, with validated readers.
+/// Built once via VirtualQuery (no content reads), then used to safely read
+/// pointers/strings — every read is bounds-checked against a region first, so it
+/// can never fault.
+pub struct RegionMap {
+    regions: Vec<(usize, usize)>, // sorted (start, end)
+}
+
+impl RegionMap {
+    /// Capture up to `max_regions` committed, readable regions. VirtualQuery only.
+    pub fn capture(max_regions: usize) -> RegionMap {
+        let mut regions: Vec<(usize, usize)> = Vec::new();
+        unsafe {
+            let mut addr: usize = 0;
+            loop {
+                let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                let n = VirtualQuery(
+                    addr as *const c_void,
+                    &mut mbi,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                );
+                if n == 0 {
+                    break;
+                }
+                let base = mbi.BaseAddress as usize;
+                let size = mbi.RegionSize;
+                let next = base.saturating_add(size);
+                if mbi.State == MEM_COMMIT && is_readable(mbi.Protect) && size >= 8 {
+                    regions.push((base, next));
+                    if regions.len() >= max_regions {
+                        break;
+                    }
+                }
+                if next <= addr {
+                    break;
+                }
+                addr = next;
+            }
+        }
+        regions.sort_by_key(|r| r.0);
+        RegionMap { regions }
+    }
+
+    /// True iff [addr, addr+len) fits entirely within one region.
+    fn in_region(&self, addr: usize, len: usize) -> bool {
+        let end = match addr.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        let idx = match self.regions.binary_search_by(|r| r.0.cmp(&addr)) {
+            Ok(i) => i,
+            Err(0) => return false,
+            Err(i) => i - 1,
+        };
+        let (start, region_end) = self.regions[idx];
+        addr >= start && end <= region_end
+    }
+
+    fn read_u64(&self, addr: usize) -> Option<u64> {
+        if self.in_region(addr, 8) {
+            Some(unsafe { *(addr as *const u64) })
+        } else {
+            None
+        }
+    }
+
+    /// NUL-terminated printable-ASCII string (<= 63 chars) at `addr`, or None.
+    fn read_name(&self, addr: usize) -> Option<String> {
+        if !self.in_region(addr, 64) {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, 64) };
+        let mut s = String::new();
+        for &b in bytes {
+            if b == 0 {
+                return Some(s);
+            }
+            if !(0x20..=0x7E).contains(&b) {
+                return None;
+            }
+            s.push(b as char);
+        }
+        None
+    }
+
+    /// True iff `p` points at an image-shaped struct (name at +0 ends ".dll").
+    fn is_image(&self, p: usize) -> bool {
+        if p == 0 {
+            return false;
+        }
+        let name_ptr = match self.read_u64(p) {
+            Some(v) => v as usize,
+            None => return false,
+        };
+        match self.read_name(name_ptr) {
+            Some(name) => name.len() > 4 && name.ends_with(".dll"),
+            None => false,
+        }
+    }
+
+    /// If `p` is an Il2CppClass-shaped struct (image back-ptr @0, name @0x10,
+    /// namespace @0x18), return (name, namespace).
+    fn class_fields(&self, p: usize) -> Option<(String, String)> {
+        let image_ptr = self.read_u64(p.checked_add(0x00)?)? as usize;
+        if !self.is_image(image_ptr) {
+            return None;
+        }
+        let name_ptr = self.read_u64(p.checked_add(0x10)?)? as usize;
+        let ns_ptr = self.read_u64(p.checked_add(0x18)?)? as usize;
+        let name = self.read_name(name_ptr)?;
+        if name.is_empty() {
+            return None;
+        }
+        let ns = self.read_name(ns_ptr)?;
+        Some((name, ns))
+    }
+}
+
+/// Locate il2cpp's class table (`s_TypeInfoTable`) ONCE: the densest contiguous
+/// array of slots that are each either NULL (an unloaded type) or a pointer to a
+/// class-shaped struct. Returns `(base_addr, slot_count)` of the best run, or
+/// None. Bounded to the crash-safe region envelope; adjacent sub-regions are
+/// coalesced so a table split across them stays one run.
+pub fn find_class_table() -> Option<(usize, usize)> {
+    const MAX_REGIONS: usize = 8192;
+    const MAX_SCAN_REGIONS: usize = 64;
+    const MIN_CLASSES: usize = 64;
+    let map = RegionMap::capture(MAX_REGIONS);
+
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for &(s, e) in map.regions.iter().take(MAX_SCAN_REGIONS) {
+        if let Some(last) = merged.last_mut() {
+            if last.1 == s {
+                last.1 = e;
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+
+    let mut best: Option<(usize, usize, usize)> = None; // (base, slots, class_count)
+    for &(start, end) in merged.iter() {
+        let mut a = start;
+        let mut run_start = 0usize;
+        let mut run_slots = 0usize;
+        let mut run_classes = 0usize;
+        let mut in_run = false;
+        while a + 8 <= end {
+            // Safe: [a, a+8) is inside this committed, readable region.
+            let slot = unsafe { *(a as *const u64) } as usize;
+            let classy = slot != 0 && map.class_fields(slot).is_some();
+            if slot == 0 || classy {
+                if !in_run {
+                    in_run = true;
+                    run_start = a;
+                    run_slots = 0;
+                    run_classes = 0;
+                }
+                run_slots += 1;
+                if classy {
+                    run_classes += 1;
+                }
+            } else if in_run {
+                if run_classes >= MIN_CLASSES && best.map_or(true, |(_, _, bc)| run_classes > bc) {
+                    best = Some((run_start, run_slots, run_classes));
+                }
+                in_run = false;
+            }
+            a += 8;
+        }
+        if in_run
+            && run_classes >= MIN_CLASSES
+            && best.map_or(true, |(_, _, bc)| run_classes > bc)
+        {
+            best = Some((run_start, run_slots, run_classes));
+        }
+    }
+    best.map(|(base, slots, _)| (base, slots))
+}
+
+/// Re-read a located class table: walk `count` slots from `base` and collect
+/// (name, namespace) for every slot that points to a class-shaped struct. Cheap
+/// relative to a full scan — this is the per-tick "watch" read. Read-only.
+pub fn read_class_table(base: usize, count: usize) -> Vec<(String, String)> {
+    const MAX_REGIONS: usize = 8192;
+    let map = RegionMap::capture(MAX_REGIONS);
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < count {
+        let a = base.wrapping_add(i * 8);
+        if let Some(slot) = map.read_u64(a) {
+            let p = slot as usize;
+            if p != 0 {
+                if let Some(pair) = map.class_fields(p) {
+                    out.push(pair);
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}

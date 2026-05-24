@@ -37,6 +37,7 @@ mod tests {
                     DumpedField { name: "health".to_string(), type_name: "System.Int32".to_string() },
                     DumpedField { name: "name".to_string(), type_name: "System.String".to_string() },
                 ],
+                methods: vec![],
             }],
         };
 
@@ -62,6 +63,7 @@ class Game.Player {
                 namespace: String::new(),
                 name: "Bare".to_string(),
                 fields: vec![],
+                methods: vec![],
             }],
         };
 

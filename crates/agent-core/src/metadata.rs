@@ -143,6 +143,7 @@ pub fn parse_metadata(bytes: &[u8], layout: &MetadataLayout) -> Option<Dump> {
                 namespace: read_name(ns_idx),
                 name: read_name(name_idx),
                 fields,
+                methods: Vec::new(),
             });
         }
     }
@@ -309,6 +310,7 @@ mod tests {
                     DumpedField { name: "health".to_string(), type_name: String::new() },
                     DumpedField { name: "mana".to_string(), type_name: String::new() },
                 ],
+                methods: vec![],
             }]
         );
     }
