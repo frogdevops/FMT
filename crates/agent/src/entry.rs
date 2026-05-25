@@ -93,6 +93,7 @@ fn il2cpp_type_name(
     map: &RegionMap, type_ptr: usize,
     type_maps: &TypeMaps,
     cfg: &Il2CppConfig,
+    api: &Il2CppApi,
 ) -> String {
     let data64 = match map.read_u64(type_ptr) {
         Some(v) => v,
@@ -126,7 +127,7 @@ fn il2cpp_type_name(
             if arr_struct != 0 {
                 if let Some(elem_type_addr) = map.read_u64(arr_struct) {
                     if elem_type_addr != 0 {
-                        let elem_name = il2cpp_type_name(map, elem_type_addr as usize, type_maps, cfg);
+                        let elem_name = il2cpp_type_name(map, elem_type_addr as usize, type_maps, cfg, api);
                         return format!("{}[]", elem_name);
                     }
                 }
@@ -161,8 +162,13 @@ fn il2cpp_type_name(
                 if let Some((cn, cns)) = type_maps.klass_map.get(&klass_ptr) {
                     return if cns.is_empty() { cn.clone() } else { format!("{}::{}", cns, cn) };
                 }
+                // Ultimate fallback: query class_get_name directly via FFI for dynamic types
+                let cn = unsafe { cstr_to_string((api.class_get_name)(klass_ptr as *mut c_void)) };
+                if !cn.is_empty() {
+                    let ns = unsafe { cstr_to_string((api.class_get_namespace)(klass_ptr as *mut c_void)) };
+                    return if ns.is_empty() { cn } else { format!("{}::{}", ns, cn) };
+                }
             }
-            // Diagnostic: log first few unresolved CLASS/VALUETYPE
             static MISSING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if MISSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
                 let mut raw = String::new();
@@ -280,7 +286,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                 let fname = unsafe { cstr_to_string((api.field_get_name)(f)) };
                 let ftype_ptr = unsafe { (api.field_get_type)(f) };
                 let ftype = if !ftype_ptr.is_null() {
-                    il2cpp_type_name(&map, ftype_ptr as usize, &type_maps, &cfg)
+                    il2cpp_type_name(&map, ftype_ptr as usize, &type_maps, &cfg, &api)
                 } else { "?".to_string() };
                 rt_fields.push((fname, ftype));
                 runtime_field_count += 1;
@@ -293,7 +299,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                 if let Some(ta) = types_array {
                     let ptr_addr = ta + (type_idx as usize) * 8;
                     if let Some(type_ptr) = map.read_u64(ptr_addr) {
-                        let tn = il2cpp_type_name(&map, type_ptr as usize, &type_maps, &cfg);
+                        let tn = il2cpp_type_name(&map, type_ptr as usize, &type_maps, &cfg, &api);
                         if !tn.is_empty() && tn != "?" {
                             return tn;
                         }
@@ -345,7 +351,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                         if let Some(ta) = types_array {
                             let ptr_addr = ta + (ti as usize) * 8;
                             if let Some(type_ptr) = map.read_u64(ptr_addr) {
-                                let r = il2cpp_type_name(&map, type_ptr as usize, &type_maps, &cfg);
+                                let r = il2cpp_type_name(&map, type_ptr as usize, &type_maps, &cfg, &api);
                                 if !r.is_empty() && r != "?" { return Some(r); }
                             }
                         }
