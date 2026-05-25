@@ -52,8 +52,15 @@ fn proof_next() -> bool {
 /// - `klass_map`: keyed by klass address (direct pointer)
 /// The klass_map is a fallback for when the td_map key doesn't match (packed flags differ).
 pub struct TypeMaps {
+    // Still built each run and retained as a secondary lookup surface, but the
+    // string-heap-base path is now the primary CLASS/VALUETYPE resolver, so these
+    // two maps have no in-crate reader at the moment. Kept (not removed) per design;
+    // allow(dead_code) avoids a spurious warning without dropping the data.
+    #[allow(dead_code)]
     pub td_map: HashMap<usize, (usize, String, String)>,
+    #[allow(dead_code)]
     pub klass_map: HashMap<usize, (String, String)>,
+    pub string_heap_base: Option<usize>,
 }
 
 pub fn build_type_maps(
@@ -65,6 +72,7 @@ pub fn build_type_maps(
 ) -> TypeMaps {
     let mut td_map: HashMap<usize, (usize, String, String)> = HashMap::new();
     let mut klass_map: HashMap<usize, (String, String)> = HashMap::new();
+    let mut base_votes: HashMap<usize, usize> = HashMap::new();
     let max = table_count.min(Tunables::load().table_max_slots);
     let mut c_slot = 0usize;
     let mut c_nonzero = 0usize;
@@ -96,18 +104,18 @@ pub fn build_type_maps(
                         continue;
                     }
                     let ns = unsafe { cstr_to_string((api.class_get_namespace)(k as *mut c_void)) };
-                    // Strike-to-nail proof: derive string_heap_base = name_ptr - nameIndex.
-                    // `td` is byval_arg.data (the typedef handle); its first u32 is the
-                    // nameIndex (hypothesis). If candidate_base is identical across
-                    // classes, that's the real base and every type name unlocks.
-                    if proof_next() {
-                        let np = map.read_u64(k + 0x10).unwrap_or(0) as usize;
-                        let name_idx = map.read_u32(td).unwrap_or(0);
-                        let base = np.wrapping_sub(name_idx as usize);
-                        log(&format!(
-                            "  BASEPROOF class='{}' k={:#x} name_ptr={:#x} td={:#x} nameIdx={:#x} candidate_base={:#x}",
-                            cn, k, np, td, name_idx, base
-                        ));
+                    // Derive string_heap_base = name_ptr - nameIndex and vote.
+                    // name ptr is at klass+0x10 (il2cpp class name offset, stable); td is
+                    // byval_arg.data (a typedef ptr); nameIndex is the typedef's first u32.
+                    // base = name_ptr - nameIndex; the consensus across classes is the
+                    // real per-launch runtime base.
+                    if let (Some(np), Some(name_idx)) = (map.read_u64(k + 0x10), map.read_u32(td)) {
+                        let np = np as usize;
+                        let name_idx = name_idx as usize;
+                        if np > name_idx {
+                            let cand = np - name_idx;
+                            *base_votes.entry(cand).or_insert(0) += 1;
+                        }
                     }
                     if !td_map.contains_key(&td) {
                         td_map.insert(td, (k, cn.clone(), ns.clone()));
@@ -130,7 +138,35 @@ pub fn build_type_maps(
         c_td_ok,
         c_td_fail
     ));
-    TypeMaps { td_map, klass_map }
+    let string_heap_base = base_votes
+        .iter()
+        .max_by_key(|(_, &c)| c)
+        .filter(|(_, &c)| c >= 8)
+        .map(|(&b, _)| b);
+    log(&format!(
+        "  string_heap_base = {:?} (top candidate votes; {} distinct candidates)",
+        string_heap_base.map(|b| format!("{:#x}", b)),
+        base_votes.len()
+    ));
+    TypeMaps { td_map, klass_map, string_heap_base }
+}
+
+/// Resolve a type name from a typedef pointer using the derived string-heap base.
+/// `typedef_ptr` is `Il2CppType.data` for a CLASS/VALUETYPE — a pointer into the
+/// Il2CppTypeDefinition table. nameIndex@+0, namespaceIndex@+4 (u32 each) index
+/// the string heap. Returns "Namespace::Name" (or "Name" when namespace empty),
+/// or None if anything is unreadable / the name is empty.
+fn typedef_name(map: &RegionMap, base: usize, typedef_ptr: usize) -> Option<String> {
+    let name_idx = map.read_u32(typedef_ptr)? as usize;
+    let name = map.read_name(base.checked_add(name_idx)?)?;
+    if name.is_empty() {
+        return None;
+    }
+    let ns = map
+        .read_u32(typedef_ptr + 4)
+        .and_then(|ni| map.read_name(base.checked_add(ni as usize)?))
+        .unwrap_or_default();
+    Some(if ns.is_empty() { name } else { format!("{}::{}", ns, name) })
 }
 
 /// Resolve an `Il2CppType*` to a human-readable type name.
@@ -218,38 +254,29 @@ pub fn il2cpp_type_name(
             return "System.Generic".into();
         }
         0x11 | 0x12 => {
-            let klass_ptr = data64 as usize;
-            if klass_ptr != 0 {
-                if let Some(td_raw) = map.read_u64(klass_ptr + cfg.klass_type_def) {
-                    let td = td_raw as usize;
-                    if let Some((_, cn, cns)) = type_maps.td_map.get(&td) {
-                        return if cns.is_empty() {
-                            cn.clone()
-                        } else {
-                            format!("{}::{}", cns, cn)
-                        };
+            let p = data64 as usize;
+            if p != 0 {
+                // PRIMARY: data64 is a typedef ptr → resolve via string heap.
+                if let Some(base) = type_maps.string_heap_base {
+                    if let Some(name) = typedef_name(map, base, p) {
+                        // Optional one-time side-by-side validation against FFI.
+                        if proof_next() {
+                            let ffi = unsafe { cstr_to_string((api.class_get_name)(p as *mut c_void)) };
+                            log(&format!(
+                                "  RESOLVED base-method='{}' ffi='{}' typedef_ptr={:#x}",
+                                name, ffi, p
+                            ));
+                        }
+                        return name;
                     }
                 }
-                if let Some((cn, cns)) = type_maps.klass_map.get(&klass_ptr) {
-                    return if cns.is_empty() {
-                        cn.clone()
-                    } else {
-                        format!("{}::{}", cns, cn)
-                    };
-                }
-                // Ultimate fallback: query class_get_name directly via FFI for dynamic types
-                let cn = unsafe { cstr_to_string((api.class_get_name)(klass_ptr as *mut c_void)) };
+                // SECONDARY: rare builds store a runtime klass ptr here.
+                let cn = unsafe { cstr_to_string((api.class_get_name)(p as *mut c_void)) };
                 if !cn.is_empty() {
-                    let ns =
-                        unsafe { cstr_to_string((api.class_get_namespace)(klass_ptr as *mut c_void)) };
+                    let ns = unsafe { cstr_to_string((api.class_get_namespace)(p as *mut c_void)) };
                     return if ns.is_empty() { cn } else { format!("{}::{}", ns, cn) };
                 }
             }
-            // CLASS/VALUETYPE we couldn't name: `data64` is a metadata handle, not
-            // a runtime klass pointer, so td_map/klass_map/FFI all missed. Rather
-            // than mislabel it `System.Object`/`System.ValueType` (false precision),
-            // mark it honestly as unresolved. The real name needs the metadata-root
-            // (string_heap_base + nameIndex) — tracked separately.
             return if tc == 0x11 {
                 "<unresolved-struct>".into()
             } else {
