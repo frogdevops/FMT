@@ -54,7 +54,7 @@ fn build_type_maps(
 ) -> TypeMaps {
     let mut td_map: HashMap<usize, (usize, String, String)> = HashMap::new();
     let mut klass_map: HashMap<usize, (String, String)> = HashMap::new();
-    let max = table_count.min(15000);
+    let max = table_count.min(20000);
     let mut c_slot = 0usize; let mut c_nonzero = 0usize;
     let mut c_td_ok = 0usize; let mut c_td_fail = 0usize;
     let mut c_ns_ok = 0usize;
@@ -262,7 +262,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     let mut seen_in_runtime: HashSet<(String, String)> = HashSet::new();
     let mut runtime_field_count = 0usize;
 
-    for i in 0..table_count.min(15000) {
+    for i in 0..table_count.min(20000) {
         let a = table_base.wrapping_add(i * cfg.class_table_step);
         if let Some(slot) = map.read_u64(a) {
             let cls = slot as *mut std::ffi::c_void;
