@@ -297,7 +297,28 @@ unsafe fn resolve_scrambled_exports(
 impl Il2CppApi {
     /// Resolve all needed exports from GameAssembly.dll. Returns None if the
     /// module isn't loaded or any export is missing (e.g. a hostile runtime).
-    pub unsafe fn resolve_from_game_assembly() -> Option<Il2CppApi> {
+    /// Resolve il2cpp exports via obfuscated/scrambled name matching (bytecode
+/// pattern search). This is what `dump_struct_diagnostics` uses internally
+/// and it works for games like Pixel Worlds where standard names are missing.
+pub unsafe fn resolve_obfuscated_api() -> Option<Il2CppApi> {
+    let module = GetModuleHandleA(b"GameAssembly.dll\0".as_ptr());
+    if module.is_null() { return None; }
+    // Poll briefly for domain init so the caller gets a ready-to-use API.
+    use std::thread::sleep;
+    use std::time::Duration;
+    for _ in 0..30 {
+        if let Some(api) = resolve_scrambled_exports(module) {
+            if !(api.domain_get)().is_null() {
+                return Some(api);
+            }
+        }
+        sleep(Duration::from_millis(200));
+    }
+    // Final try without domain check — caller can handle null domain.
+    resolve_scrambled_exports(module)
+}
+
+pub unsafe fn resolve_from_game_assembly() -> Option<Il2CppApi> {
         let module = GetModuleHandleA(b"GameAssembly.dll\0".as_ptr());
         if module.is_null() {
             return None;

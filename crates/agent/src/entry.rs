@@ -255,55 +255,104 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     // run of consecutive pointers to Il2CppClass-shaped structs and reads their
     // names. No exports called, no hardcoded names; every deref is in_region-gated.
     log("=== PULL TEST: locate table once, then watch it (1s poll) — ENTER A WORLD ===");
-    {
-        use std::collections::HashSet;
-        // Phase 1a: locate s_TypeInfoTable once, retrying while it first populates.
-        let mut table: Option<(usize, usize)> = None;
-        for _ in 0..30 {
-            if let Some(t) = find_class_table() {
-                table = Some(t);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(500));
+    use std::collections::HashSet;
+    // Phase 1a: locate s_TypeInfoTable once, retrying while it first populates.
+    let mut table_base: usize = 0;
+    let mut table_count: usize = 0;
+    let mut table_found = false;
+    for _ in 0..30 {
+        if let Some((base, count)) = find_class_table() {
+            table_base = base;
+            table_count = count;
+            table_found = true;
+            break;
         }
-        match table {
-            None => log("  FAILED to locate class table (needs sub-phase 1a)"),
-            Some((base, count)) => {
-                log(&format!("  located table @ {:#x}, {} slots", base, count));
-                // Phase 1b: watch — re-read ONLY the table each tick and diff.
-                let mut seen: HashSet<String> = HashSet::new();
-                const PASSES: usize = 60;
-                const INTERVAL_MS: u64 = 1000;
-                for pass in 1..=PASSES {
-                    let classes = read_class_table(base, count);
-                    let mut new_count = 0usize;
-                    let mut sample: Vec<String> = Vec::new();
-                    for (name, ns) in &classes {
-                        let full = if ns.is_empty() {
-                            name.clone()
-                        } else {
-                            format!("{}::{}", ns, name)
-                        };
-                        if seen.insert(full.clone()) {
-                            new_count += 1;
-                            if sample.len() < 40 {
-                                sample.push(full);
-                            }
-                        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if table_found {
+        log(&format!("  located table @ {:#x}, {} slots", table_base, table_count));
+        // Phase 1b: watch — re-read ONLY the table each tick and diff.
+        let mut seen: HashSet<String> = HashSet::new();
+        const PASSES: usize = 60;
+        const INTERVAL_MS: u64 = 1000;
+        for pass in 1..=PASSES {
+            let classes = read_class_table(table_base, table_count);
+            let mut new_count = 0usize;
+            let mut sample: Vec<String> = Vec::new();
+            for (name, ns) in &classes {
+                let full = if ns.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}::{}", ns, name)
+                };
+                if seen.insert(full.clone()) {
+                    new_count += 1;
+                    if sample.len() < 40 {
+                        sample.push(full);
                     }
-                    log(&format!(
-                        "  pass {}/{}: live={}, new={}",
-                        pass, PASSES, classes.len(), new_count
-                    ));
-                    for full in &sample {
-                        log(&format!("    + {}", full));
-                    }
-                    std::thread::sleep(Duration::from_millis(INTERVAL_MS));
                 }
             }
+            log(&format!(
+                "  pass {}/{}: live={}, new={}",
+                pass, PASSES, classes.len(), new_count
+            ));
+            for full in &sample {
+                log(&format!("    + {}", full));
+            }
+            std::thread::sleep(Duration::from_millis(INTERVAL_MS));
         }
+    } else {
+        log("  FAILED to locate class table (needs sub-phase 1a)");
     }
     log("=== end PULL TEST ===");
+
+    // Phase 2: resolve il2cpp FFI and dump fields for each class in the table.
+    // Uses the class table (proven safe) + game's own getter functions.
+    if table_found {
+        log("=== FIELD DUMP via FFI ===");
+        if let Some(api) = unsafe { crate::il2cpp_ffi::Il2CppApi::resolve_obfuscated_api() } {
+            use crate::mem_scan::RegionMap;
+            let map = RegionMap::capture(8192);
+            let mut fields_total = 0usize;
+            for i in 0..table_count.min(5000) {
+                let a = table_base.wrapping_add(i * 8);
+                if let Some(slot) = map.read_u64(a) {
+                    let cls = slot as *mut c_void;
+                    if cls.is_null() { continue; }
+                    let cname = unsafe { crate::il2cpp_ffi::cstr_to_string((api.class_get_name)(cls)) };
+                    let cns = unsafe { crate::il2cpp_ffi::cstr_to_string((api.class_get_namespace)(cls)) };
+                    let full = if cns.is_empty() { cname } else { format!("{}::{}", cns, cname) };
+                    let mut iter: *mut c_void = std::ptr::null_mut();
+                    let mut flds: Vec<String> = Vec::new();
+                    loop {
+                        let f = unsafe { (api.class_get_fields)(cls, &mut iter) };
+                        if f.is_null() { break; }
+                        if flds.len() >= 20 { break; }
+                        let fname = unsafe { crate::il2cpp_ffi::cstr_to_string((api.field_get_name)(f)) };
+                        let ftype_ptr = unsafe { (api.field_get_type)(f) };
+                        let ftype = if !ftype_ptr.is_null() {
+                            // Il2CppType.data.klass is at offset 0 (class/valuetype pointer).
+                            // Validate via RegionMap::class_fields (checks image back-ptr, name, ns).
+                            match map.read_u64(ftype_ptr as usize).and_then(|k| map.class_fields(k as usize)) {
+                                Some((fname_klass, _)) => fname_klass,
+                                None => "?".to_string(),
+                            }
+                        } else { "?".to_string() };
+                        flds.push(format!("    {}: {}", fname, ftype));
+                        fields_total += 1;
+                    }
+                    if !flds.is_empty() {
+                        log(&format!("  {} ({} fields):", full, flds.len()));
+                        for ff in &flds { log(ff); }
+                    }
+                }
+            }
+            log(&format!("  TOTAL fields dumped: {}", fields_total));
+        } else {
+            log("  FAILED to resolve il2cpp API");
+        }
+        log("=== end FIELD DUMP ===");
+    }
     return 0;
 
     // Diagnostic build: the blind full-process blob scans are removed here. We

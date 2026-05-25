@@ -455,7 +455,7 @@ impl RegionMap {
         addr >= start && end <= region_end
     }
 
-    fn read_u64(&self, addr: usize) -> Option<u64> {
+    pub fn read_u64(&self, addr: usize) -> Option<u64> {
         if self.in_region(addr, 8) {
             Some(unsafe { *(addr as *const u64) })
         } else {
@@ -499,7 +499,7 @@ impl RegionMap {
 
     /// If `p` is an Il2CppClass-shaped struct (image back-ptr @0, name @0x10,
     /// namespace @0x18), return (name, namespace).
-    fn class_fields(&self, p: usize) -> Option<(String, String)> {
+    pub fn class_fields(&self, p: usize) -> Option<(String, String)> {
         let image_ptr = self.read_u64(p.checked_add(0x00)?)? as usize;
         if !self.is_image(image_ptr) {
             return None;
