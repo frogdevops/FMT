@@ -27,6 +27,11 @@ type ThreadAttach = unsafe extern "C" fn(*mut Il2CppDomain) -> *mut Il2CppThread
 type ImageGetName = unsafe extern "C" fn(*mut Il2CppImage) -> *const c_char;
 
 /// Resolved il2cpp entry points.
+///
+/// Many fields look unused to the Rust dead-code lint because they're only
+/// invoked through transmuted function pointers — the lint can't see across
+/// FFI boundaries. They are all called from the dump pipeline.
+#[allow(dead_code)]
 pub struct Il2CppApi {
     pub domain_get: DomainGet,
     pub domain_get_assemblies: DomainGetAssemblies,
@@ -415,6 +420,7 @@ pub unsafe fn readable_len(ptr: *const u8, max: usize) -> usize {
 }
 
 /// True if at least `len` bytes at `ptr` are readable.
+#[allow(dead_code)] // kept for ad-hoc safety checks during future hook work
 pub unsafe fn mem_readable(ptr: *const u8, len: usize) -> bool {
     len > 0 && readable_len(ptr, len) >= len
 }
@@ -432,6 +438,7 @@ pub unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     String::from_utf8_lossy(&bytes[..len]).into_owned()
 }
 
+#[allow(dead_code)] // used by `dump_struct_diagnostics`, kept for IDE-plugin hooks
 unsafe fn hex_dump(ptr: *const u8, len: usize) -> String {
     if !mem_readable(ptr, len) {
         return "<unreadable>".to_string();
@@ -451,6 +458,10 @@ unsafe fn hex_dump(ptr: *const u8, len: usize) -> String {
 /// reliably-resolved getters (all proven safe), and hex-dump the domain and
 /// image structs so their layout can be analyzed offline. Never calls the
 /// crash-prone accessors (image_get_class / class_get_* / field_*).
+///
+/// Not on the dump path — the upcoming IDE plugin will call this for the
+/// "inspect runtime structs" debug command.
+#[allow(dead_code)]
 pub unsafe fn dump_struct_diagnostics() -> Vec<String> {
     use std::thread::sleep;
     use std::time::Duration;
