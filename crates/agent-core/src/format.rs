@@ -34,8 +34,8 @@ mod tests {
                 namespace: "Game".to_string(),
                 name: "Player".to_string(),
                 fields: vec![
-                    DumpedField { name: "health".to_string(), type_name: "System.Int32".to_string() },
-                    DumpedField { name: "name".to_string(), type_name: "System.String".to_string() },
+                    DumpedField { name: "health".to_string(), type_name: "System.Int32".to_string(), type_index: None },
+                    DumpedField { name: "name".to_string(), type_name: "System.String".to_string(), type_index: None },
                 ],
                 methods: vec![],
             }],

@@ -12,7 +12,7 @@ pub fn build_dump(rt: &dyn Il2CppRuntime) -> Dump {
             fields: c
                 .fields
                 .into_iter()
-                .map(|f| DumpedField { name: f.name, type_name: f.type_name })
+                .map(|f| DumpedField { name: f.name, type_name: f.type_name, type_index: None })
                 .collect(),
             methods: Vec::new(),
         })
@@ -59,7 +59,7 @@ mod tests {
         assert_eq!(dump.classes, vec![
             DumpedClass { namespace: "Game".into(), name: "Enemy".into(), fields: vec![], methods: vec![] },
             DumpedClass { namespace: "Game".into(), name: "Player".into(), fields: vec![
-                DumpedField { name: "health".into(), type_name: "System.Int32".into() },
+                DumpedField { name: "health".into(), type_name: "System.Int32".into(), type_index: None },
             ], methods: vec![] },
         ]);
     }
