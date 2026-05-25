@@ -70,7 +70,6 @@ struct ExportedFunc {
 }
 
 /// Dynamic signature scanner for resolving scrambled/obfuscated exports.
-#[allow(dead_code)]
 unsafe fn resolve_scrambled_exports(
     module: windows_sys::Win32::Foundation::HMODULE,
 ) -> Option<Il2CppApi> {
@@ -179,6 +178,11 @@ unsafe fn resolve_scrambled_exports(
             domain_get_candidates.push(exp);
         }
     }
+    crate::paths::log(&format!(
+        "  sig-scan: domain_get candidates matched = {} (using first @ {:?})",
+        domain_get_candidates.len(),
+        domain_get_candidates.first().map(|c| c.final_addr)
+    ));
     let domain_get_func = domain_get_candidates.first()?;
 
     // 2. domain_get_assemblies -> Computes assembly count: (end_ptr - start_ptr) >> 3
@@ -315,9 +319,19 @@ impl Il2CppApi {
     /// isn't there or its layout is too foreign for either path.
     pub unsafe fn resolve() -> Option<Il2CppApi> {
         if let Some(api) = Self::resolve_from_game_assembly() {
+            crate::paths::log("  il2cpp API resolved via standard exports");
             return Some(api);
         }
-        Self::resolve_obfuscated_api()
+        match Self::resolve_obfuscated_api() {
+            Some(api) => {
+                crate::paths::log("  il2cpp API resolved via signature scan (obfuscated build)");
+                Some(api)
+            }
+            None => {
+                crate::paths::log("  il2cpp API resolution FAILED (neither standard exports nor signature scan)");
+                None
+            }
+        }
     }
 
     /// Bytecode-pattern resolver for obfuscated runtimes. Polls briefly for
@@ -371,10 +385,9 @@ pub unsafe fn resolve_from_game_assembly() -> Option<Il2CppApi> {
             })
         };
 
-        // Only the stable standard exports are used. The signature-scanner is
-        // retired from the resolution path: calling a mis-resolved obfuscated
-        // function crashes the game (uncatchable). Obfuscated games are handled
-        // by the read-only metadata memory-scan (mem_scan) instead.
+        // Standard exports only. This succeeds on non-obfuscated Unity games.
+        // Obfuscated builds (mangled export names) return None here and the
+        // caller (`resolve`) falls back to the bytecode signature scanner.
         resolve_std()
     }
 }
@@ -419,12 +432,6 @@ pub unsafe fn readable_len(ptr: *const u8, max: usize) -> usize {
     avail.min(max)
 }
 
-/// True if at least `len` bytes at `ptr` are readable.
-#[allow(dead_code)] // kept for ad-hoc safety checks during future hook work
-pub unsafe fn mem_readable(ptr: *const u8, len: usize) -> bool {
-    len > 0 && readable_len(ptr, len) >= len
-}
-
 /// Convert a C string pointer into an owned Rust String, safely.
 /// Returns "" for null/unreadable pointers; bounded so a non-terminated
 /// string can't run off the end of mapped memory.
@@ -436,121 +443,4 @@ pub unsafe fn cstr_to_string(ptr: *const c_char) -> String {
     let bytes = std::slice::from_raw_parts(ptr as *const u8, avail);
     let len = bytes.iter().position(|&b| b == 0).unwrap_or(avail);
     String::from_utf8_lossy(&bytes[..len]).into_owned()
-}
-
-#[allow(dead_code)] // used by `dump_struct_diagnostics`, kept for IDE-plugin hooks
-unsafe fn hex_dump(ptr: *const u8, len: usize) -> String {
-    if !mem_readable(ptr, len) {
-        return "<unreadable>".to_string();
-    }
-    let slice = std::slice::from_raw_parts(ptr, len);
-    let mut s = String::with_capacity(len * 3);
-    for (i, b) in slice.iter().enumerate() {
-        if i > 0 && i % 16 == 0 {
-            s.push_str("| ");
-        }
-        s.push_str(&format!("{:02X} ", b));
-    }
-    s
-}
-
-/// One-shot recon: walk domain -> assemblies[0] -> image using ONLY the
-/// reliably-resolved getters (all proven safe), and hex-dump the domain and
-/// image structs so their layout can be analyzed offline. Never calls the
-/// crash-prone accessors (image_get_class / class_get_* / field_*).
-///
-/// Not on the dump path — the upcoming IDE plugin will call this for the
-/// "inspect runtime structs" debug command.
-#[allow(dead_code)]
-pub unsafe fn dump_struct_diagnostics() -> Vec<String> {
-    use std::thread::sleep;
-    use std::time::Duration;
-
-    let mut out = Vec::new();
-
-    // GameAssembly.dll isn't mapped at process start — poll for it (up to 60s).
-    let mut module = GetModuleHandleA(b"GameAssembly.dll\0".as_ptr());
-    let mut attempts = 0;
-    while module.is_null() {
-        attempts += 1;
-        if attempts > 600 {
-            out.push("GameAssembly.dll never loaded (waited 60s)".to_string());
-            return out;
-        }
-        sleep(Duration::from_millis(100));
-        module = GetModuleHandleA(b"GameAssembly.dll\0".as_ptr());
-    }
-
-    // Resolve the (obfuscated) exports — export table is present once mapped.
-    let api = match resolve_scrambled_exports(module) {
-        Some(a) => a,
-        None => {
-            out.push("resolve_scrambled_exports failed (could not anchor)".to_string());
-            return out;
-        }
-    };
-
-    // Wait for the il2cpp domain to be initialized (domain_get returns null until init).
-    let mut domain = (api.domain_get)();
-    let mut dattempts = 0;
-    while domain.is_null() {
-        dattempts += 1;
-        if dattempts > 600 {
-            out.push("il2cpp domain never initialized (waited 60s)".to_string());
-            return out;
-        }
-        sleep(Duration::from_millis(100));
-        domain = (api.domain_get)();
-    }
-
-    out.push(format!("domain = {:p}", domain));
-    out.push(format!("domain[0x00..0x80]: {}", hex_dump(domain as *const u8, 0x80)));
-
-    let mut count: usize = 0;
-    let assemblies = (api.domain_get_assemblies)(domain, &mut count);
-    out.push(format!("assemblies = {:p}, count = {}", assemblies, count));
-    if assemblies.is_null() || count == 0 {
-        return out;
-    }
-
-    let asm = *assemblies; // first assembly
-    let image = (api.assembly_get_image)(asm);
-    let name = cstr_to_string((api.image_get_name)(image));
-    out.push(format!(
-        "assembly[0] = {:p}, image = {:p}, name = '{}'",
-        asm, image, name
-    ));
-    out.push(format!("image[0x00..0x100]: {}", hex_dump(image as *const u8, 0x100)));
-
-    // Bytecode of the resolved accessors — their machine code encodes the struct
-    // offsets they read (e.g. `mov rax,[rcx+0x10]; ret`), and image_get_class's
-    // code reveals how it reaches the class table. Read-only.
-    out.push("--- accessor bytecode (first 32 bytes) ---".to_string());
-    let dump_fn = |name: &str, p: usize, out: &mut Vec<String>| {
-        let ptr = p as *const u8;
-        out.push(format!("{:<22} @ {:#x}: {}", name, p, hex_dump(ptr, 32)));
-    };
-    dump_fn("image_get_class_count", api.image_get_class_count as usize, &mut out);
-    dump_fn("image_get_class", api.image_get_class as usize, &mut out);
-    dump_fn("class_get_name", api.class_get_name as usize, &mut out);
-    dump_fn("class_get_namespace", api.class_get_namespace as usize, &mut out);
-    dump_fn("class_get_fields", api.class_get_fields.map(|f| f as usize).unwrap_or(0), &mut out);
-    dump_fn("field_get_name", api.field_get_name as usize, &mut out);
-    dump_fn("field_get_type", api.field_get_type as usize, &mut out);
-    dump_fn("type_get_name", api.type_get_name as usize, &mut out);
-    dump_fn("image_get_name", api.image_get_name as usize, &mut out);
-    dump_fn("assembly_get_image", api.assembly_get_image as usize, &mut out);
-
-    // Follow the pointer at image+0x28 (the one image field we haven't chased).
-    let p28_addr = image as usize + 0x28;
-    if mem_readable(p28_addr as *const u8, 8) {
-        let p28 = *(p28_addr as *const usize);
-        out.push(format!(
-            "image+0x28 -> {:#x}: {}",
-            p28,
-            hex_dump(p28 as *const u8, 0x80)
-        ));
-    }
-
-    out
 }

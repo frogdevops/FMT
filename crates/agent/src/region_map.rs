@@ -162,13 +162,11 @@ impl RegionMap {
 /// |---------------------------------|------------------|--------------------------------|
 /// | `FROG_MAX_REGIONS`              | 8192             | Region-capture budget          |
 /// | `FROG_MAX_SCAN_REGIONS`         | 64               | Crash-safe scan envelope       |
-/// | `FROG_SLOT_BUDGET`              | 250_000_000      | Max slots to scan              |
 /// | `FROG_MIN_CLASSES`              | 64               | Min classes to accept a run    |
 /// | `FROG_TABLE_MAX_SLOTS`          | 20000            | Max class-table slots to read  |
 pub struct Tunables {
     pub max_regions: usize,
     pub max_scan_regions: usize,
-    pub slot_budget: u64,
     pub min_classes: usize,
     pub table_max_slots: usize,
 }
@@ -178,15 +176,10 @@ impl Tunables {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     }
 
-    fn from_env_u64(name: &str, default: u64) -> u64 {
-        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-    }
-
     pub fn load() -> Self {
         Self {
             max_regions:      Self::from_env("FROG_MAX_REGIONS", 8192),
             max_scan_regions: Self::from_env("FROG_MAX_SCAN_REGIONS", 64),
-            slot_budget:      Self::from_env_u64("FROG_SLOT_BUDGET", 250_000_000),
             min_classes:      Self::from_env("FROG_MIN_CLASSES", 64),
             table_max_slots:  Self::from_env("FROG_TABLE_MAX_SLOTS", 20000),
         }

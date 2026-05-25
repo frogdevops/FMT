@@ -22,7 +22,7 @@ use crate::region_map::{RegionMap, Tunables};
 /// are informational — the runtime path falls back gracefully — so we keep a
 /// few samples for triage and drop the rest. Override at runtime by setting
 /// the `FROG_DEBUG=1` environment variable.
-const DIAG_SAMPLE_CAP: u32 = 5;
+const DIAG_SAMPLE_CAP: u32 = 0;
 
 pub fn diag_cap() -> u32 {
     if std::env::var("FROG_DEBUG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
@@ -30,6 +30,20 @@ pub fn diag_cap() -> u32 {
     } else {
         DIAG_SAMPLE_CAP
     }
+}
+
+/// Proof sampler (Phase C): when `FROG_PROVE=1`, emit up to `PROOF_CAP` lines
+/// showing the RAW underlying value next to a name-recovery attempt for the
+/// ambiguous type arms (VAR, and CLASS/VALUETYPE fallbacks). Read-only; settles
+/// empirically whether those outputs are recoverable names or junk mis-reads.
+const PROOF_CAP: u32 = 40;
+fn prove_enabled() -> bool {
+    std::env::var("FROG_PROVE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+}
+static PROOF_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn proof_next() -> bool {
+    prove_enabled()
+        && PROOF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < PROOF_CAP
 }
 
 /// Two lookup strategies:
@@ -154,6 +168,14 @@ pub fn il2cpp_type_name(
         0x10 | 0x19 => return "System.UIntPtr".into(),
         0x13 => {
             // VAR — generic type parameter (!0, !1, etc.)
+            if proof_next() {
+                let kind = if data64 < 0x10000 { "small-index(legit !N)" } else { "pointer-like(mis-read)" };
+                let readable = map.in_region(data64 as usize, 8);
+                log(&format!(
+                    "  PROOF VAR tptr={:#x} data64={:#018x} as_u16={} verdict={} data64_readable={}",
+                    type_ptr, data64, data64 as u16, kind, readable
+                ));
+            }
             return format!("!{}", data64 as u16);
         }
         0x14 => {
@@ -236,6 +258,15 @@ pub fn il2cpp_type_name(
                     "  MISSING tc={:#x} k={:#x} td_rdable={} td_val={:#x} in_td={} in_kl={} td_sz={} kl_sz={} tptr={:#x}: {}",
                     tc, klass, td_readable, td_val, in_td, in_kl,
                     type_maps.td_map.len(), type_maps.klass_map.len(), type_ptr, raw
+                ));
+            }
+            if proof_next() {
+                let klass = data64 as usize;
+                let recovered = map.class_fields(klass);
+                log(&format!(
+                    "  PROOF CLS tc={:#x} klass={:#x} class_fields={:?} (fallback={})",
+                    tc, klass, recovered,
+                    if tc == 0x11 { "System.ValueType" } else { "System.Object" }
                 ));
             }
             return if tc == 0x11 {
