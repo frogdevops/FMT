@@ -264,6 +264,20 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         arr
     });
 
+    // Build metadata reverse map: type_byval_type_index → (namespace, name)
+    // Used as fallback when the types array can't be found in memory.
+    let type_index_to_name: HashMap<u32, (String, String)> = metadata_result.as_ref().map_or_else(HashMap::new, |mr| {
+        let mut m = HashMap::new();
+        for c in &mr.dump.classes {
+            let ti = c.type_index;
+            if ti != 0 && !m.contains_key(&ti) {
+                m.insert(ti, (c.namespace.clone(), c.name.clone()));
+            }
+        }
+        log(&format!("  type_index→name map: {} entries", m.len()));
+        m
+    });
+
     let mut all_lines: Vec<String> = Vec::new();
     let mut seen_in_runtime: HashSet<(String, String)> = HashSet::new();
     let mut runtime_field_count = 0usize;
@@ -305,6 +319,10 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                         }
                     }
                 }
+                // Fallback: reverse map (type_byval_type_index → type def name)
+                if let Some((ns, cn)) = type_index_to_name.get(&type_idx) {
+                    return if ns.is_empty() { cn.clone() } else { format!("{}::{}", ns, cn) };
+                }
                 String::new()
             };
 
@@ -315,12 +333,16 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                     let mut fields: Vec<String> = Vec::new();
                     let rt_lookup: HashMap<&str, &str> = rt_fields.iter()
                         .map(|(n, t)| (n.as_str(), t.as_str())).collect();
+                    let is_missing = |s: &str| s == "System.ValueType" || s == "System.Object" || s == "?" || s.is_empty();
                     for mf in &meta_class.fields {
-                        let tn = rt_lookup.get(mf.name.as_str()).map(|s| s.to_string())
-                            .or_else(|| mf.type_index.and_then(|ti| {
+                        let tn = mf.type_index.and_then(|ti| {
                                 let r = type_from_idx(ti);
                                 if r.is_empty() { None } else { Some(r) }
-                            }))
+                            })
+                            .or_else(|| {
+                                let rt = rt_lookup.get(mf.name.as_str())?;
+                                if is_missing(rt) { None } else { Some((*rt).to_string()) }
+                            })
                             .unwrap_or_else(|| "<?>".to_string());
                         fields.push(field_line(&mf.name, &tn));
                     }
@@ -355,7 +377,10 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                                 if !r.is_empty() && r != "?" { return Some(r); }
                             }
                         }
-                        None
+                        // Fallback: reverse map
+                        type_index_to_name.get(&ti).map(|(ns, cn)| {
+                            if ns.is_empty() { cn.clone() } else { format!("{}::{}", ns, cn) }
+                        })
                     }).unwrap_or_else(|| "<?>".to_string());
                     field_line(&f.name, &tn)
                 }).collect();

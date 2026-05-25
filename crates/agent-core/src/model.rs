@@ -13,6 +13,10 @@ pub struct DumpedClass {
     pub name: String,
     pub fields: Vec<DumpedField>,
     pub methods: Vec<String>,
+    /// Index of this type's `Il2CppType` in the codegen types array
+    /// (Il2CppMetadataRegistration.types). Extracted from the type
+    /// definition's `byvalTypeIndex` field.
+    pub type_index: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -46,6 +50,7 @@ mod tests {
                 name: "Player".into(),
                 fields: vec![],
                 methods: vec!["Update".into(), "Start".into()],
+                type_index: 0,
             }],
         };
         assert_eq!(dump.total_methods(), 2);

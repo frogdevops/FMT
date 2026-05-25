@@ -30,15 +30,16 @@ mod tests {
     #[test]
     fn formats_classes_and_fields() {
         let dump = Dump {
-            classes: vec![DumpedClass {
-                namespace: "Game".to_string(),
-                name: "Player".to_string(),
-                fields: vec![
-                    DumpedField { name: "health".to_string(), type_name: "System.Int32".to_string(), type_index: None },
-                    DumpedField { name: "name".to_string(), type_name: "System.String".to_string(), type_index: None },
-                ],
-                methods: vec![],
-            }],
+        classes: vec![DumpedClass {
+            namespace: "Game".into(),
+            name: "Player".into(),
+            fields: vec![
+                DumpedField { name: "health".into(), type_name: "System.Int32".into(), type_index: None },
+                DumpedField { name: "mana".into(), type_name: "System.Single".into(), type_index: None },
+            ],
+            methods: vec![],
+            type_index: 0,
+        }],
         };
 
         let text = format_dump(&dump);
@@ -49,7 +50,7 @@ mod tests {
 
 class Game.Player {
     System.Int32 health;
-    System.String name;
+    System.Single mana;
 }
 
 ";
@@ -59,14 +60,15 @@ class Game.Player {
     #[test]
     fn omits_namespace_when_empty() {
         let dump = Dump {
-            classes: vec![DumpedClass {
-                namespace: String::new(),
-                name: "Bare".to_string(),
-                fields: vec![],
-                methods: vec![],
-            }],
+        classes: vec![DumpedClass {
+            namespace: "System".into(),
+            name: "Object".into(),
+            fields: vec![],
+            methods: vec![],
+            type_index: 0,
+        }],
         };
 
-        assert!(format_dump(&dump).contains("class Bare {\n}"));
+        assert!(format_dump(&dump).contains("class System.Object {\n}"));
     }
 }

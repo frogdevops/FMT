@@ -15,6 +15,7 @@ pub fn build_dump(rt: &dyn Il2CppRuntime) -> Dump {
                 .map(|f| DumpedField { name: f.name, type_name: f.type_name, type_index: None })
                 .collect(),
             methods: Vec::new(),
+            type_index: 0,
         })
         .collect();
 
@@ -57,10 +58,10 @@ mod tests {
 
         // Compiler-generated `<...>` class is filtered out; rest sorted by (namespace, name).
         assert_eq!(dump.classes, vec![
-            DumpedClass { namespace: "Game".into(), name: "Enemy".into(), fields: vec![], methods: vec![] },
+            DumpedClass { namespace: "Game".into(), name: "Enemy".into(), fields: vec![], methods: vec![], type_index: 0 },
             DumpedClass { namespace: "Game".into(), name: "Player".into(), fields: vec![
                 DumpedField { name: "health".into(), type_name: "System.Int32".into(), type_index: None },
-            ], methods: vec![] },
+            ], methods: vec![], type_index: 0 },
         ]);
     }
 }

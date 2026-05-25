@@ -27,6 +27,9 @@ pub struct MetadataLayout {
     pub type_size: usize,
     pub type_name_index: usize,
     pub type_namespace_index: usize,
+    /// Index of this type's `Il2CppType` in the codegen types array.
+    /// Also known as `byvalTypeIndex`, `typeIndex`, or `byvalTypeIndex` in Il2CppDumper.
+    pub type_byval_type_index: usize,
     pub type_field_start: usize,
     pub type_field_count: usize,
     pub field_size: usize,
@@ -123,6 +126,7 @@ pub fn parse_metadata(bytes: &[u8], layout: &MetadataLayout) -> Option<Dump> {
                 None => continue,
             };
             let ns_idx = read_u32(bytes, tdef + layout.type_namespace_index).unwrap_or(0);
+            let byval_type_idx = read_u32(bytes, tdef + layout.type_byval_type_index).unwrap_or(0);
             let field_start = read_i32(bytes, tdef + layout.type_field_start).unwrap_or(-1);
             let field_count = read_u16(bytes, tdef + layout.type_field_count).unwrap_or(0) as usize;
 
@@ -132,11 +136,11 @@ pub fn parse_metadata(bytes: &[u8], layout: &MetadataLayout) -> Option<Dump> {
                 for f in 0..field_count {
                     let fdef = h.fields_offset as usize + (fs + f) * layout.field_size;
                     if let Some(fname_idx) = read_u32(bytes, fdef + layout.field_name_index) {
-                        let type_idx = read_u32(bytes, fdef + layout.field_type_index);
+                        let field_type_idx = read_u32(bytes, fdef + layout.field_type_index);
                         fields.push(DumpedField {
                             name: read_name(fname_idx),
                             type_name: String::new(),
-                            type_index: type_idx,
+                            type_index: field_type_idx,
                         });
                     }
                 }
@@ -147,6 +151,7 @@ pub fn parse_metadata(bytes: &[u8], layout: &MetadataLayout) -> Option<Dump> {
                 name: read_name(name_idx),
                 fields,
                 methods: Vec::new(),
+                type_index: byval_type_idx,
             });
         }
     }
@@ -375,11 +380,12 @@ pub fn compute_layout(version: u32) -> Option<MetadataLayout> {
         image_type_start:    field_offset(version, IMAGE_FIELDS, "typeStart")?,
         image_type_count:    field_offset(version, IMAGE_FIELDS, "typeCount")?,
 
-        type_size:           s_sz(TYPE_FIELDS),
-        type_name_index:     field_offset(version, TYPE_FIELDS, "nameIndex")?,
-        type_namespace_index: field_offset(version, TYPE_FIELDS, "namespaceIndex")?,
-        type_field_start:    field_offset(version, TYPE_FIELDS, "fieldStart")?,
-        type_field_count:    field_offset(version, TYPE_FIELDS, "field_count")?,
+        type_size:              s_sz(TYPE_FIELDS),
+        type_name_index:        field_offset(version, TYPE_FIELDS, "nameIndex")?,
+        type_namespace_index:   field_offset(version, TYPE_FIELDS, "namespaceIndex")?,
+        type_byval_type_index:  field_offset(version, TYPE_FIELDS, "byvalTypeIndex")?,
+        type_field_start:       field_offset(version, TYPE_FIELDS, "fieldStart")?,
+        type_field_count:       field_offset(version, TYPE_FIELDS, "field_count")?,
 
         field_size:          s_sz(FIELD_FIELDS),
         field_name_index:    field_offset(version, FIELD_FIELDS, "nameIndex")?,
@@ -419,11 +425,12 @@ pub(crate) const TEST_LAYOUT: MetadataLayout = MetadataLayout {
     image_name_index: 0,
     image_type_start: 4,
     image_type_count: 8,
-    type_size: 16,
+    type_size: 20,
     type_name_index: 0,
     type_namespace_index: 4,
-    type_field_start: 8,
-    type_field_count: 12,
+    type_byval_type_index: 8,
+    type_field_start: 12,
+    type_field_count: 16,
     field_size: 8,
     field_name_index: 0,
     field_type_index: 4,
@@ -454,14 +461,14 @@ mod tests {
         h[0..4].copy_from_slice(&METADATA_MAGIC.to_le_bytes());
         h[4..8].copy_from_slice(&29u32.to_le_bytes());
         let put = |h: &mut [u8], pos: usize, v: u32| h[pos..pos + 4].copy_from_slice(&v.to_le_bytes());
-        put(&mut h, 8, 40);
-        put(&mut h, 12, 24);
-        put(&mut h, 16, 80);
-        put(&mut h, 20, 16);
-        put(&mut h, 24, 96);
-        put(&mut h, 28, 16);
-        put(&mut h, 32, 64);
-        put(&mut h, 36, 16);
+        put(&mut h, 8, 40);  // string offset
+        put(&mut h, 12, 24); // string size
+        put(&mut h, 16, 80); // type_defs offset
+        put(&mut h, 20, 20); // type_defs size (one 20-byte type)
+        put(&mut h, 24, 100);// fields offset (40 + 24 + 16 + 20 = 100)
+        put(&mut h, 28, 16); // fields size
+        put(&mut h, 32, 64); // images offset
+        put(&mut h, 36, 16); // images size
         h
     }
 
@@ -488,13 +495,14 @@ mod tests {
         img[8..12].copy_from_slice(&1u32.to_le_bytes());
         b.extend_from_slice(&img);
         assert_eq!(b.len(), 80);
-        let mut ty = vec![0u8; 16];
-        ty[0..4].copy_from_slice(&5u32.to_le_bytes());
-        ty[4..8].copy_from_slice(&0u32.to_le_bytes());
-        ty[8..12].copy_from_slice(&0i32.to_le_bytes());
-        ty[12..14].copy_from_slice(&2u16.to_le_bytes());
+        let mut ty = vec![0u8; 20];
+        ty[0..4].copy_from_slice(&5u32.to_le_bytes());   // nameIndex
+        ty[4..8].copy_from_slice(&0u32.to_le_bytes());   // namespaceIndex
+        ty[8..12].copy_from_slice(&0u32.to_le_bytes());  // byvalTypeIndex = 0
+        ty[12..16].copy_from_slice(&0i32.to_le_bytes()); // fieldStart
+        ty[16..18].copy_from_slice(&2u16.to_le_bytes()); // field_count
         b.extend_from_slice(&ty);
-        assert_eq!(b.len(), 96);
+        assert_eq!(b.len(), 100);
         let mut f0 = vec![0u8; 8];
         f0[0..4].copy_from_slice(&12u32.to_le_bytes());
         let mut f1 = vec![0u8; 8];
@@ -518,6 +526,7 @@ mod tests {
                     DumpedField { name: "mana".to_string(), type_name: String::new(), type_index: Some(0) },
                 ],
                 methods: vec![],
+                type_index: 0,
             }]
         );
     }
