@@ -17,21 +17,6 @@ use crate::il2cpp_ffi::{cstr_to_string, Il2CppApi};
 use crate::paths::log;
 use crate::region_map::{RegionMap, Tunables};
 
-/// Per-run cap on how many noisy diagnostic lines we emit for unresolved
-/// CLASS/VALUETYPE references and the GENERICINST struct-shape probe. These
-/// are informational — the runtime path falls back gracefully — so we keep a
-/// few samples for triage and drop the rest. Override at runtime by setting
-/// the `FROG_DEBUG=1` environment variable.
-const DIAG_SAMPLE_CAP: u32 = 0;
-
-pub fn diag_cap() -> u32 {
-    if std::env::var("FROG_DEBUG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
-        u32::MAX
-    } else {
-        DIAG_SAMPLE_CAP
-    }
-}
-
 /// String-heap-base derivation proof: when `FROG_PROVE=1`, emit up to `PROOF_CAP`
 /// lines from `build_type_maps`, one per loaded class, showing the candidate
 /// `string_heap_base = name_ptr - nameIndex`. If the candidate is identical across
@@ -237,19 +222,39 @@ pub fn il2cpp_type_name(
             return "System.Array".into();
         }
         0x15 => {
-            // GENERICINST — data64 points to Il2CppGenericClass. Log a handful
-            // of raw struct dumps so we can fingerprint the layout offline; the
-            // rest are silenced unless `FROG_DEBUG=1`.
-            static GEN_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if GEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < diag_cap() {
-                let mut raw = String::new();
-                let gc_addr = data64 as usize;
-                for off in (0..48).step_by(8) {
-                    if let Some(v) = map.read_u64(gc_addr + off) {
-                        raw.push_str(&format!("+{:#x}={:#018x} ", off, v));
+            // GENERICINST — data64 points to Il2CppGenericClass. PROBE: confirm the
+            // layout by manually resolving ONE level — the generic definition type
+            // (+0x0 = Il2CppType*) and the first type-arg (context.class_inst @ +0x8
+            // = Il2CppGenericInst* { argc@+0, argv@+0x8 = Il2CppType** }). If def
+            // resolves to e.g. "List`1" and arg0 to "Block", the layout is proven and
+            // we wire full recursive rendering. Read-only, FROG_PROVE-gated.
+            if proof_next() {
+                let gc = data64 as usize;
+                let mut hex = String::new();
+                for off in (0..0x20).step_by(8) {
+                    match map.read_u64(gc + off) {
+                        Some(v) => hex.push_str(&format!("+{:#x}={:#018x} ", off, v)),
+                        None => hex.push_str(&format!("+{:#x}=<unmapped> ", off)),
                     }
                 }
-                log(&format!("  GENERICINST @ {:#x}: {}", gc_addr, raw));
+                let base = type_maps.string_heap_base;
+                // def type @ +0x0 → Il2CppType* → its data (+0) = typedef ptr → name
+                let def_name = map
+                    .read_u64(gc)
+                    .and_then(|tp| map.read_u64(tp as usize))
+                    .and_then(|td| base.and_then(|b| typedef_name(map, b, td as usize)));
+                // class_inst @ +0x8 → Il2CppGenericInst* { argc@+0, argv@+0x8 }
+                let class_inst = map.read_u64(gc + 0x8).unwrap_or(0) as usize;
+                let argc = map.read_u32(class_inst).unwrap_or(0);
+                let argv = map.read_u64(class_inst + 0x8).unwrap_or(0) as usize;
+                let arg0_name = map
+                    .read_u64(argv)
+                    .and_then(|tp| map.read_u64(tp as usize))
+                    .and_then(|td| base.and_then(|b| typedef_name(map, b, td as usize)));
+                log(&format!(
+                    "  GENPROBE gc={:#x}: {}| def={:?} class_inst={:#x} argc={} arg0={:?}",
+                    gc, hex, def_name, class_inst, argc, arg0_name
+                ));
             }
             return "System.Generic".into();
         }
@@ -259,14 +264,6 @@ pub fn il2cpp_type_name(
                 // PRIMARY: data64 is a typedef ptr → resolve via string heap.
                 if let Some(base) = type_maps.string_heap_base {
                     if let Some(name) = typedef_name(map, base, p) {
-                        // Optional one-time side-by-side validation against FFI.
-                        if proof_next() {
-                            let ffi = unsafe { cstr_to_string((api.class_get_name)(p as *mut c_void)) };
-                            log(&format!(
-                                "  RESOLVED base-method='{}' ffi='{}' typedef_ptr={:#x}",
-                                name, ffi, p
-                            ));
-                        }
                         return name;
                     }
                 }
