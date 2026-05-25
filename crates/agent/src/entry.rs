@@ -39,11 +39,21 @@ fn log(line: &str) {
     let _ = append_log(&log_path(), line);
 }
 
-fn build_type_map(
+/// Two lookup strategies:
+/// - `td_map`: keyed by `klass + klass_type_def` value (packed typeDefIndex + flags)
+/// - `klass_map`: keyed by klass address (direct pointer)
+/// The klass_map is a fallback for when the td_map key doesn't match (packed flags differ).
+struct TypeMaps {
+    td_map: HashMap<usize, (usize, String, String)>,
+    klass_map: HashMap<usize, (String, String)>,
+}
+
+fn build_type_maps(
     table_base: usize, table_count: usize,
     api: &Il2CppApi, map: &RegionMap, cfg: &Il2CppConfig,
-) -> HashMap<usize, (usize, String, String)> {
-    let mut tm: HashMap<usize, (usize, String, String)> = HashMap::new();
+) -> TypeMaps {
+    let mut td_map: HashMap<usize, (usize, String, String)> = HashMap::new();
+    let mut klass_map: HashMap<usize, (String, String)> = HashMap::new();
     let max = table_count.min(15000);
     let mut c_slot = 0usize; let mut c_nonzero = 0usize;
     let mut c_td_ok = 0usize; let mut c_td_fail = 0usize;
@@ -62,24 +72,26 @@ fn build_type_map(
                     c_td_ok += 1;
                     if td == 0 { continue; }
                     let td = td as usize;
-                    if tm.contains_key(&td) { continue; }
                     let cn = unsafe { cstr_to_string((api.class_get_name)(k as *mut c_void)) };
                     if cn.is_empty() { continue; }
                     let ns = unsafe { cstr_to_string((api.class_get_namespace)(k as *mut c_void)) };
-                    tm.insert(td, (k, cn, ns));
+                    if !td_map.contains_key(&td) {
+                        td_map.insert(td, (k, cn.clone(), ns.clone()));
+                    }
+                    klass_map.insert(k, (cn, ns));
                 }
                 None => { c_td_fail += 1; }
             }
         }
     }
-    log(&format!("  type map: {} built (slots={}, ptrs={}, ns_ok={}, td_ok={}, td_fail={})",
-        tm.len(), c_slot, c_nonzero, c_ns_ok, c_td_ok, c_td_fail));
-    tm
+    log(&format!("  type maps: td={} klass={} (slots={}, ptrs={}, ns_ok={}, td_ok={}, td_fail={})",
+        td_map.len(), klass_map.len(), c_slot, c_nonzero, c_ns_ok, c_td_ok, c_td_fail));
+    TypeMaps { td_map, klass_map }
 }
 
 fn il2cpp_type_name(
     map: &RegionMap, type_ptr: usize,
-    type_map: &HashMap<usize, (usize, String, String)>,
+    type_maps: &TypeMaps,
     cfg: &Il2CppConfig,
 ) -> String {
     let data64 = match map.read_u64(type_ptr) {
@@ -109,14 +121,12 @@ fn il2cpp_type_name(
             // VAR — generic type parameter (!0, !1, etc.)
             return format!("!{}", data64 as u16);
         }
-        0x14 => {
-            // ARRAY (multi-dim or bounded) — data64 is pointer to Il2CppArrayType.
-            // First 8 bytes of Il2CppArrayType = pointer to element Il2CppType.
+         0x14 => {
             let arr_struct = data64 as usize;
             if arr_struct != 0 {
                 if let Some(elem_type_addr) = map.read_u64(arr_struct) {
                     if elem_type_addr != 0 {
-                        let elem_name = il2cpp_type_name(map, elem_type_addr as usize, type_map, cfg);
+                        let elem_name = il2cpp_type_name(map, elem_type_addr as usize, type_maps, cfg);
                         return format!("{}[]", elem_name);
                     }
                 }
@@ -142,12 +152,14 @@ fn il2cpp_type_name(
         0x11 | 0x12 => {
             let klass_ptr = data64 as usize;
             if klass_ptr != 0 {
-                // data64 is the Il2CppClass pointer; type_map is keyed by klass->klass_type_def
                 if let Some(td_raw) = map.read_u64(klass_ptr + cfg.klass_type_def) {
                     let td = td_raw as usize;
-                    if let Some((_, cn, cns)) = type_map.get(&td) {
+                    if let Some((_, cn, cns)) = type_maps.td_map.get(&td) {
                         return if cns.is_empty() { cn.clone() } else { format!("{}::{}", cns, cn) };
                     }
+                }
+                if let Some((cn, cns)) = type_maps.klass_map.get(&klass_ptr) {
+                    return if cns.is_empty() { cn.clone() } else { format!("{}::{}", cns, cn) };
                 }
             }
             // Diagnostic: log first few unresolved CLASS/VALUETYPE
@@ -162,10 +174,10 @@ fn il2cpp_type_name(
                 let klass = data64 as usize;
                 let td_readable = map.in_region(klass + cfg.klass_type_def, 8);
                 let td_val = map.read_u64(klass + cfg.klass_type_def).unwrap_or(0);
-                let in_map = type_map.contains_key(&(td_val as usize));
-                let map_len = type_map.len();
-                log(&format!("  MISSING tc={:#x} k={:#x} td_rdable={} td_val={:#x} in_map={} map_sz={} tptr={:#x}: {}",
-                    tc, klass, td_readable, td_val, in_map, map_len, type_ptr, raw));
+                let in_td = type_maps.td_map.contains_key(&(td_val as usize));
+                let in_kl = type_maps.klass_map.contains_key(&klass);
+                log(&format!("  MISSING tc={:#x} k={:#x} td_rdable={} td_val={:#x} in_td={} in_kl={} td_sz={} kl_sz={} tptr={:#x}: {}",
+                    tc, klass, td_readable, td_val, in_td, in_kl, type_maps.td_map.len(), type_maps.klass_map.len(), type_ptr, raw));
             }
             return if tc == 0x11 { "System.ValueType".into() } else { "System.Object".into() };
         }
@@ -231,7 +243,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     log("  waiting 8s for classes to load...");
     std::thread::sleep(Duration::from_secs(8));
     map = RegionMap::capture(8192);
-    let type_map = build_type_map(table_base, table_count, &api, &map, &cfg);
+    let type_maps = build_type_maps(table_base, table_count, &api, &map, &cfg);
 
     // Phase 0b: find Il2CppMetadataRegistration.types array for typeIndex resolution
     // (requires `map` which is only available after the 8s settle wait)
@@ -268,7 +280,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                 let fname = unsafe { cstr_to_string((api.field_get_name)(f)) };
                 let ftype_ptr = unsafe { (api.field_get_type)(f) };
                 let ftype = if !ftype_ptr.is_null() {
-                    il2cpp_type_name(&map, ftype_ptr as usize, &type_map, &cfg)
+                    il2cpp_type_name(&map, ftype_ptr as usize, &type_maps, &cfg)
                 } else { "?".to_string() };
                 rt_fields.push((fname, ftype));
                 runtime_field_count += 1;
@@ -281,7 +293,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                 if let Some(ta) = types_array {
                     let ptr_addr = ta + (type_idx as usize) * 8;
                     if let Some(type_ptr) = map.read_u64(ptr_addr) {
-                        let tn = il2cpp_type_name(&map, type_ptr as usize, &type_map, &cfg);
+                        let tn = il2cpp_type_name(&map, type_ptr as usize, &type_maps, &cfg);
                         if !tn.is_empty() && tn != "?" {
                             return tn;
                         }
@@ -333,7 +345,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                         if let Some(ta) = types_array {
                             let ptr_addr = ta + (ti as usize) * 8;
                             if let Some(type_ptr) = map.read_u64(ptr_addr) {
-                                let r = il2cpp_type_name(&map, type_ptr as usize, &type_map, &cfg);
+                                let r = il2cpp_type_name(&map, type_ptr as usize, &type_maps, &cfg);
                                 if !r.is_empty() && r != "?" { return Some(r); }
                             }
                         }
