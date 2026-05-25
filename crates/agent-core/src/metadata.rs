@@ -31,6 +31,7 @@ pub struct MetadataLayout {
     pub type_field_count: usize,
     pub field_size: usize,
     pub field_name_index: usize,
+    pub field_type_index: usize,
 }
 
 pub(crate) fn read_u32(bytes: &[u8], pos: usize) -> Option<u32> {
@@ -131,9 +132,11 @@ pub fn parse_metadata(bytes: &[u8], layout: &MetadataLayout) -> Option<Dump> {
                 for f in 0..field_count {
                     let fdef = h.fields_offset as usize + (fs + f) * layout.field_size;
                     if let Some(fname_idx) = read_u32(bytes, fdef + layout.field_name_index) {
+                        let type_idx = read_u32(bytes, fdef + layout.field_type_index);
                         fields.push(DumpedField {
                             name: read_name(fname_idx),
-                            type_name: String::new(), // phase 2
+                            type_name: String::new(),
+                            type_index: type_idx,
                         });
                     }
                 }
@@ -170,6 +173,15 @@ pub fn find_and_parse(
     bytes: &[u8],
     layout_for: impl Fn(u32) -> Option<MetadataLayout>,
 ) -> Option<Dump> {
+    find_and_parse_with_offset(bytes, layout_for).map(|(_, d)| d)
+}
+
+/// Like `find_and_parse`, but also returns the byte offset within `bytes` where
+/// the matching metadata blob was found. The offset is relative to `bytes[0]`.
+pub fn find_and_parse_with_offset(
+    bytes: &[u8],
+    layout_for: impl Fn(u32) -> Option<MetadataLayout>,
+) -> Option<(usize, Dump)> {
     for off in find_magic_offsets(bytes) {
         let version = match read_u32(bytes, off + 4) {
             Some(v) => v,
@@ -181,22 +193,216 @@ pub fn find_and_parse(
         };
         if let Some(dump) = parse_metadata(&bytes[off..], &layout) {
             if !dump.classes.is_empty() {
-                return Some(dump);
+                return Some((off, dump));
             }
         }
     }
     None
 }
 
-/// Map a metadata version number to its byte layout. Real layouts are filled in
-/// later (transcribed from Il2CppDumper); until then this returns `None`, so the
-/// scanner finds nothing rather than misparsing. Add `29 => Some(LAYOUT_V29),`
-/// etc. as each layout lands.
-pub fn layout_for_version(_version: u32) -> Option<MetadataLayout> {
-    match _version {
-        // 29 => Some(LAYOUT_V29),
-        _ => None,
+// ── Struct field definitions ─────────────────────────────────────
+// Each entry describes one field of a C# struct used in Il2CppDumper.
+// `size` is the byte width, `min_ver`/`max_ver` are the version range
+// (inclusive) where this field exists.  `None` means unbounded.
+
+#[derive(Debug, Clone, Copy)]
+struct FieldDef {
+    size: usize,
+    min_ver: Option<u32>,
+    max_ver: Option<u32>,
+}
+
+fn ok_for_version(version: u32, f: &FieldDef) -> bool {
+    f.min_ver.map_or(true, |v| version >= v)
+        && f.max_ver.map_or(true, |v| version <= v)
+}
+
+fn struct_size_named(version: u32, fields: &[(&str, FieldDef)]) -> usize {
+    let mut acc = 0usize;
+    for (_, fd) in fields {
+        if ok_for_version(version, fd) {
+            acc += fd.size;
+        }
     }
+    acc
+}
+
+/// Compute the byte offset of a named field (case-sensitive) within a
+/// struct for the given `version`.  Returns `None` if the name is unknown
+/// or if the field is absent for this version.
+fn field_offset(version: u32, fields: &[(&str, FieldDef)], name: &str) -> Option<usize> {
+    let mut off = 0usize;
+    for (n, fd) in fields {
+        let ok = fd.min_ver.map_or(true, |v| version >= v)
+            && fd.max_ver.map_or(true, |v| version <= v);
+        if *n == name {
+            return if ok { Some(off) } else { None };
+        }
+        if ok {
+            off += fd.size;
+        }
+    }
+    None
+}
+
+// ── Header struct: Il2CppGlobalMetadataHeader ────────────────────
+// (u32 offset, i32 size) pairs.  sanity (4) + version (4) comes first,
+// then the alternating pairs.
+const HEADER_FIELDS: &[(&str, FieldDef)] = &[
+    ("_sanity", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("_version", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    // Actual header data sections (each is offset+size = 8 bytes):
+    ("stringLiteral", FieldDef { size: 8, min_ver: Some(16), max_ver: None }),
+    ("stringLiteralData", FieldDef { size: 8, min_ver: Some(16), max_ver: None }),
+    ("string",              FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("events",              FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("properties",          FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("methods",             FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("parameterDefaultValues", FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("fieldDefaultValues",  FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("fieldAndParameterDefaultValueData", FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("fieldMarshaledSizes", FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("parameters",          FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("fields",              FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("genericParameters",   FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("genericParameterConstraints", FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("genericContainers",   FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("nestedTypes",         FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("interfaces",          FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("vtableMethods",       FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("interfaceOffsets",    FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("typeDefinitions",     FieldDef { size: 8, min_ver: None, max_ver: None }),
+    // rgctxEntries removed after 24.1
+    ("rgctxEntries",        FieldDef { size: 8, min_ver: None, max_ver: Some(24) }),
+    ("images",              FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("assemblies",          FieldDef { size: 8, min_ver: None, max_ver: None }),
+    ("metadataUsageLists",  FieldDef { size: 8, min_ver: Some(19), max_ver: Some(24) }),
+    ("metadataUsagePairs",  FieldDef { size: 8, min_ver: Some(19), max_ver: Some(24) }),
+    ("fieldRefs",           FieldDef { size: 8, min_ver: Some(19), max_ver: None }),
+    ("referencedAssemblies", FieldDef { size: 8, min_ver: Some(20), max_ver: None }),
+    // attributesInfo/attributeTypes removed after 27.2 (v27 as integer)
+    ("attributesInfo",      FieldDef { size: 8, min_ver: Some(21), max_ver: Some(27) }),
+    ("attributeTypes",      FieldDef { size: 8, min_ver: Some(21), max_ver: Some(27) }),
+    // attributeData/attributeDataRange added in 29
+    ("attributeData",       FieldDef { size: 8, min_ver: Some(29), max_ver: None }),
+    ("attributeDataRange",  FieldDef { size: 8, min_ver: Some(29), max_ver: None }),
+    ("unresolvedVirtualCallParameterTypes", FieldDef { size: 8, min_ver: Some(22), max_ver: None }),
+    ("unresolvedVirtualCallParameterRanges", FieldDef { size: 8, min_ver: Some(22), max_ver: None }),
+    ("windowsRuntimeTypeNames", FieldDef { size: 8, min_ver: Some(23), max_ver: None }),
+    ("windowsRuntimeStrings", FieldDef { size: 8, min_ver: Some(27), max_ver: None }),
+    ("exportedTypeDefinitions", FieldDef { size: 8, min_ver: Some(24), max_ver: None }),
+];
+
+// ── Data structs (fields we care about) ──────────────────────────
+
+const IMAGE_FIELDS: &[(&str, FieldDef)] = &[
+    ("nameIndex",       FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("assemblyIndex",   FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("typeStart",       FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("typeCount",       FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("exportedTypeStart", FieldDef { size: 4, min_ver: Some(24), max_ver: None }),
+    ("exportedTypeCount", FieldDef { size: 4, min_ver: Some(24), max_ver: None }),
+    ("entryPointIndex", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("token",           FieldDef { size: 4, min_ver: Some(19), max_ver: None }),
+    ("customAttributeStart", FieldDef { size: 4, min_ver: Some(24), max_ver: None }),
+    ("customAttributeCount", FieldDef { size: 4, min_ver: Some(24), max_ver: None }),
+];
+
+const TYPE_FIELDS: &[(&str, FieldDef)] = &[
+    ("nameIndex",       FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("namespaceIndex",  FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("customAttributeIndex", FieldDef { size: 4, min_ver: None, max_ver: Some(24) }),
+    ("byvalTypeIndex",  FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("byrefTypeIndex",  FieldDef { size: 4, min_ver: None, max_ver: Some(24) }),
+    ("declaringTypeIndex", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("parentIndex",     FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("elementTypeIndex", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("rgctxStartIndex", FieldDef { size: 4, min_ver: None, max_ver: Some(24) }),
+    ("rgctxCount",      FieldDef { size: 4, min_ver: None, max_ver: Some(24) }),
+    ("genericContainerIndex", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("delegateWrapperFromManagedToNativeIndex", FieldDef { size: 4, min_ver: None, max_ver: Some(22) }),
+    ("marshalingFunctionsIndex", FieldDef { size: 4, min_ver: None, max_ver: Some(22) }),
+    ("ccwFunctionIndex", FieldDef { size: 4, min_ver: Some(21), max_ver: Some(22) }),
+    ("guidIndex",       FieldDef { size: 4, min_ver: Some(21), max_ver: Some(22) }),
+    ("flags",           FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("fieldStart",      FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("methodStart",     FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("eventStart",      FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("propertyStart",   FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("nestedTypesStart", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("interfacesStart", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("vtableStart",     FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("interfaceOffsetsStart", FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("method_count",    FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("property_count",  FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("field_count",     FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("event_count",     FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("nested_type_count", FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("vtable_count",    FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("interfaces_count", FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("interface_offsets_count", FieldDef { size: 2, min_ver: None, max_ver: None }),
+    ("bitfield",        FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("token",           FieldDef { size: 4, min_ver: Some(19), max_ver: None }),
+];
+
+const FIELD_FIELDS: &[(&str, FieldDef)] = &[
+    ("nameIndex",       FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("typeIndex",       FieldDef { size: 4, min_ver: None, max_ver: None }),
+    ("customAttributeIndex", FieldDef { size: 4, min_ver: None, max_ver: Some(24) }),
+    ("token",           FieldDef { size: 4, min_ver: Some(19), max_ver: None }),
+];
+
+/// Build a `MetadataLayout` for a given metadata version by computing
+/// all byte offsets from the struct definition tables above.
+pub fn compute_layout(version: u32) -> Option<MetadataLayout> {
+    if version < 16 || version > 31 { return None; }
+
+    let h_off = |name| field_offset(version, HEADER_FIELDS, name);
+    let s_sz = |fields| struct_size_named(version, fields);
+
+    Some(MetadataLayout {
+        h_string_offset:     h_off("string")?,
+        h_string_size:       h_off("string")? + 4,
+        h_type_defs_offset:  h_off("typeDefinitions")?,
+        h_type_defs_size:    h_off("typeDefinitions")? + 4,
+        h_fields_offset:     h_off("fields")?,
+        h_fields_size:       h_off("fields")? + 4,
+        h_images_offset:     h_off("images")?,
+        h_images_size:       h_off("images")? + 4,
+
+        image_size:          s_sz(IMAGE_FIELDS),
+        image_name_index:    field_offset(version, IMAGE_FIELDS, "nameIndex")?,
+        image_type_start:    field_offset(version, IMAGE_FIELDS, "typeStart")?,
+        image_type_count:    field_offset(version, IMAGE_FIELDS, "typeCount")?,
+
+        type_size:           s_sz(TYPE_FIELDS),
+        type_name_index:     field_offset(version, TYPE_FIELDS, "nameIndex")?,
+        type_namespace_index: field_offset(version, TYPE_FIELDS, "namespaceIndex")?,
+        type_field_start:    field_offset(version, TYPE_FIELDS, "fieldStart")?,
+        type_field_count:    field_offset(version, TYPE_FIELDS, "field_count")?,
+
+        field_size:          s_sz(FIELD_FIELDS),
+        field_name_index:    field_offset(version, FIELD_FIELDS, "nameIndex")?,
+        field_type_index:    field_offset(version, FIELD_FIELDS, "typeIndex")?,
+    })
+}
+
+/// Map a metadata version number to its byte layout.
+pub fn layout_for_version(version: u32) -> Option<MetadataLayout> {
+    compute_layout(version)
+}
+
+/// Compute the total count of type definitions from a decrypted metadata blob.
+/// Returns `None` if the header can't be parsed or type_defs_size is not a
+/// multiple of `type_size`.
+pub fn compute_type_count(bytes: &[u8], layout: &MetadataLayout) -> Option<u32> {
+    parse_header(bytes, layout)?;
+    let type_defs_size = read_u32(bytes, layout.h_type_defs_size)?;
+    if layout.type_size == 0 {
+        return None;
+    }
+    let count = type_defs_size / layout.type_size as u32;
+    if count == 0 { None } else { Some(count) }
 }
 
 #[cfg(test)]
@@ -220,6 +426,7 @@ pub(crate) const TEST_LAYOUT: MetadataLayout = MetadataLayout {
     type_field_count: 12,
     field_size: 8,
     field_name_index: 0,
+    field_type_index: 4,
 };
 
 #[cfg(test)]
@@ -307,8 +514,8 @@ mod tests {
                 namespace: "Game".to_string(),
                 name: "Player".to_string(),
                 fields: vec![
-                    DumpedField { name: "health".to_string(), type_name: String::new() },
-                    DumpedField { name: "mana".to_string(), type_name: String::new() },
+                    DumpedField { name: "health".to_string(), type_name: String::new(), type_index: Some(0) },
+                    DumpedField { name: "mana".to_string(), type_name: String::new(), type_index: Some(0) },
                 ],
                 methods: vec![],
             }]
@@ -351,5 +558,57 @@ mod tests {
     #[test]
     fn layout_for_unknown_version_is_none() {
         assert!(layout_for_version(9999).is_none());
+    }
+
+    #[test]
+    fn compute_layout_v24_offsets_are_sane() {
+        let l = compute_layout(24).expect("v24 should produce a layout");
+        // sanity(4) + version(4) + stringLiteral(8) + stringLiteralData(8) = 24
+        assert_eq!(l.h_string_offset, 24);
+        // ... + string(8) + events(8) + properties(8) + methods(8)
+        // + parameterDefaultValues(8) + fieldDefaultValues(8)
+        // + fieldAndParameterDefaultValueData(8) + fieldMarshaledSizes(8)
+        // + parameters(8) = 24 + 8*9 = 96
+        assert_eq!(l.h_fields_offset, 96);
+        // + fields(8) + genericParameters(8) + genericParameterConstraints(8)
+        // + genericContainers(8) + nestedTypes(8) + interfaces(8)
+        // + vtableMethods(8) + interfaceOffsets(8) = 96 + 8*8 = 160
+        assert_eq!(l.h_type_defs_offset, 160);
+        // + typeDefinitions(8) + rgctxEntries(8) = 160 + 16 = 176
+        assert_eq!(l.h_images_offset, 176);
+        assert_eq!(l.h_images_size, 180); // 176 + 4
+        // Il2CppFieldDefinition for v24: nameIndex(4)+typeIndex(4)+customAttributeIndex(4)+token(4)=16
+        assert_eq!(l.field_size, 16);
+        assert_eq!(l.field_name_index, 0);
+    }
+
+    #[test]
+    fn compute_layout_v27_removes_rgctx() {
+        let l = compute_layout(27).expect("v27 should produce a layout");
+        // v27 has no rgctxEntries, so images shifts up
+        assert_eq!(l.h_images_offset, 168); // 160 + 8 (no rgctxEntries)
+        // field_size: v27 has no customAttributeIndex (max_ver=24)
+        // nameIndex(4)+typeIndex(4)+token(4)(min_ver=19) = 12
+        assert_eq!(l.field_size, 12);
+    }
+
+    #[test]
+    fn compute_layout_v29_adds_attributes() {
+        let l = compute_layout(29).expect("v29 should produce a layout");
+        assert_eq!(l.h_images_offset, 168); // same as v27 (no rgctxEntries)
+
+        // v29 fields: nameIndex(4)+typeIndex(4)+token(4)(min=19) = 12
+        assert_eq!(l.field_size, 12);
+    }
+
+    #[test]
+    fn compute_layout_v16_produces_minimal_header() {
+        let l = compute_layout(16).expect("v16 should produce a layout");
+        // stringLiteral has min_ver=16, so it IS included
+        // sanity(4)+version(4)+stringLiteral(8)+stringLiteralData(8) = 24
+        // then string section: h_string_offset = 24
+        assert_eq!(l.h_string_offset, 24);
+        // v16: nameIndex(4)+typeIndex(4)+customAttributeIndex(4)(max=24) = 12
+        assert_eq!(l.field_size, 12);
     }
 }

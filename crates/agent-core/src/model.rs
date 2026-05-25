@@ -2,6 +2,9 @@
 pub struct DumpedField {
     pub name: String,
     pub type_name: String,
+    /// Index into the runtime Il2CppType[] array (from metadata field definition).
+    /// Populated only when the field came from a metadata parse.
+    pub type_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
