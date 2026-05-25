@@ -32,11 +32,12 @@ pub fn diag_cap() -> u32 {
     }
 }
 
-/// Proof sampler (Phase C): when `FROG_PROVE=1`, emit up to `PROOF_CAP` lines
-/// showing the RAW underlying value next to a name-recovery attempt for the
-/// ambiguous type arms (VAR, and CLASS/VALUETYPE fallbacks). Read-only; settles
-/// empirically whether those outputs are recoverable names or junk mis-reads.
-const PROOF_CAP: u32 = 40;
+/// String-heap-base derivation proof: when `FROG_PROVE=1`, emit up to `PROOF_CAP`
+/// lines from `build_type_maps`, one per loaded class, showing the candidate
+/// `string_heap_base = name_ptr - nameIndex`. If the candidate is identical across
+/// classes, that's the real base and every type name becomes
+/// `read_name(base + nameIndex)`. Read-only.
+const PROOF_CAP: u32 = 25;
 fn prove_enabled() -> bool {
     std::env::var("FROG_PROVE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
 }
@@ -95,6 +96,19 @@ pub fn build_type_maps(
                         continue;
                     }
                     let ns = unsafe { cstr_to_string((api.class_get_namespace)(k as *mut c_void)) };
+                    // Strike-to-nail proof: derive string_heap_base = name_ptr - nameIndex.
+                    // `td` is byval_arg.data (the typedef handle); its first u32 is the
+                    // nameIndex (hypothesis). If candidate_base is identical across
+                    // classes, that's the real base and every type name unlocks.
+                    if proof_next() {
+                        let np = map.read_u64(k + 0x10).unwrap_or(0) as usize;
+                        let name_idx = map.read_u32(td).unwrap_or(0);
+                        let base = np.wrapping_sub(name_idx as usize);
+                        log(&format!(
+                            "  BASEPROOF class='{}' k={:#x} name_ptr={:#x} td={:#x} nameIdx={:#x} candidate_base={:#x}",
+                            cn, k, np, td, name_idx, base
+                        ));
+                    }
                     if !td_map.contains_key(&td) {
                         td_map.insert(td, (k, cn.clone(), ns.clone()));
                     }
@@ -167,16 +181,11 @@ pub fn il2cpp_type_name(
         0x0F | 0x18 => return "System.IntPtr".into(),
         0x10 | 0x19 => return "System.UIntPtr".into(),
         0x13 => {
-            // VAR — generic type parameter (!0, !1, etc.)
-            if proof_next() {
-                let kind = if data64 < 0x10000 { "small-index(legit !N)" } else { "pointer-like(mis-read)" };
-                let readable = map.in_region(data64 as usize, 8);
-                log(&format!(
-                    "  PROOF VAR tptr={:#x} data64={:#018x} as_u16={} verdict={} data64_readable={}",
-                    type_ptr, data64, data64 as u16, kind, readable
-                ));
-            }
-            return format!("!{}", data64 as u16);
+            // VAR — generic type parameter. `data64` is a metadata handle (a
+            // pointer into the generic-parameter table), NOT a small index, so the
+            // old `data64 as u16` printed garbage (proven strikes 1-2). Until we
+            // resolve the real param name/index via the metadata root, be honest.
+            return "!?".into();
         }
         0x14 => {
             let arr_struct = data64 as usize;
@@ -236,43 +245,15 @@ pub fn il2cpp_type_name(
                     return if ns.is_empty() { cn } else { format!("{}::{}", ns, cn) };
                 }
             }
-            // CLASS/VALUETYPE whose klass_type_def isn't in either map. Most
-            // are benign races (class loaded after we built the map) or
-            // generics mis-tagged as plain class — the FFI fallback above
-            // already handled the resolvable cases. We sample a few for
-            // diagnosis and drop the rest unless full debug output is on.
-            static MISSING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if MISSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < diag_cap() {
-                let mut raw = String::new();
-                for off in (0..48).step_by(8) {
-                    if let Some(v) = map.read_u64(type_ptr + off) {
-                        raw.push_str(&format!("+{:#x}={:#018x} ", off, v));
-                    }
-                }
-                let klass = data64 as usize;
-                let td_readable = map.in_region(klass + cfg.klass_type_def, 8);
-                let td_val = map.read_u64(klass + cfg.klass_type_def).unwrap_or(0);
-                let in_td = type_maps.td_map.contains_key(&(td_val as usize));
-                let in_kl = type_maps.klass_map.contains_key(&klass);
-                log(&format!(
-                    "  MISSING tc={:#x} k={:#x} td_rdable={} td_val={:#x} in_td={} in_kl={} td_sz={} kl_sz={} tptr={:#x}: {}",
-                    tc, klass, td_readable, td_val, in_td, in_kl,
-                    type_maps.td_map.len(), type_maps.klass_map.len(), type_ptr, raw
-                ));
-            }
-            if proof_next() {
-                let klass = data64 as usize;
-                let recovered = map.class_fields(klass);
-                log(&format!(
-                    "  PROOF CLS tc={:#x} klass={:#x} class_fields={:?} (fallback={})",
-                    tc, klass, recovered,
-                    if tc == 0x11 { "System.ValueType" } else { "System.Object" }
-                ));
-            }
+            // CLASS/VALUETYPE we couldn't name: `data64` is a metadata handle, not
+            // a runtime klass pointer, so td_map/klass_map/FFI all missed. Rather
+            // than mislabel it `System.Object`/`System.ValueType` (false precision),
+            // mark it honestly as unresolved. The real name needs the metadata-root
+            // (string_heap_base + nameIndex) — tracked separately.
             return if tc == 0x11 {
-                "System.ValueType".into()
+                "<unresolved-struct>".into()
             } else {
-                "System.Object".into()
+                "<unresolved-class>".into()
             };
         }
         0x1C => return "System.Object".into(),
