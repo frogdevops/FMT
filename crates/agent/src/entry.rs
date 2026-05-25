@@ -8,11 +8,28 @@ use agent_core::model::{Dump, DumpedClass};
 
 use windows_sys::Win32::Foundation::{BOOL, HANDLE, HMODULE, TRUE};
 
-use crate::mem_scan::{find_class_table, find_types_array, scan_process_for_metadata, RegionMap};
+use crate::mem_scan::{find_class_table, find_types_array, scan_process_for_metadata, RegionMap, Tunables};
 use crate::il2cpp_ffi::{Il2CppApi, cstr_to_string};
 use crate::il2cpp_config::Il2CppConfig;
+use crate::host;
+use agent_core::respect::{should_decline, DeclineReason};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
+
+/// Per-run cap on how many noisy diagnostic lines we emit for unresolved
+/// CLASS/VALUETYPE references and the GENERICINST struct-shape probe. These
+/// are informational — the runtime path falls back gracefully — so we keep a
+/// few samples for triage and drop the rest. Override at runtime by setting
+/// the `FROG_DEBUG=1` environment variable.
+const DIAG_SAMPLE_CAP: u32 = 5;
+
+fn diag_cap() -> u32 {
+    if std::env::var("FROG_DEBUG").map(|v| v != "0" && !v.is_empty()).unwrap_or(false) {
+        u32::MAX
+    } else {
+        DIAG_SAMPLE_CAP
+    }
+}
 
 type LpthreadStartRoutine = unsafe extern "system" fn(*mut c_void) -> u32;
 
@@ -27,13 +44,18 @@ extern "system" {
     ) -> HANDLE;
 }
 
-fn log_path() -> PathBuf {
-    PathBuf::from("agent.log")
+/// Resolve a path next to the agent DLL itself, falling back to the launcher's
+/// working directory if the loader can't locate our module (very rare). This
+/// keeps `agent.log` and `internals.txt` together no matter where the game was
+/// launched from — essential when the IDE plugin tails them remotely.
+fn output_path(filename: &str) -> PathBuf {
+    host::agent_dir()
+        .map(|d| d.join(filename))
+        .unwrap_or_else(|| PathBuf::from(filename))
 }
 
-fn dump_path() -> PathBuf {
-    PathBuf::from("internals.txt")
-}
+fn log_path() -> PathBuf { output_path("agent.log") }
+fn dump_path() -> PathBuf { output_path("internals.txt") }
 
 fn log(line: &str) {
     let _ = append_log(&log_path(), line);
@@ -54,7 +76,7 @@ fn build_type_maps(
 ) -> TypeMaps {
     let mut td_map: HashMap<usize, (usize, String, String)> = HashMap::new();
     let mut klass_map: HashMap<usize, (String, String)> = HashMap::new();
-    let max = table_count.min(20000);
+    let max = table_count.min(Tunables::load().table_max_slots);
     let mut c_slot = 0usize; let mut c_nonzero = 0usize;
     let mut c_td_ok = 0usize; let mut c_td_fail = 0usize;
     let mut c_ns_ok = 0usize;
@@ -89,6 +111,23 @@ fn build_type_maps(
     TypeMaps { td_map, klass_map }
 }
 
+/// Resolve an `Il2CppType*` to a human-readable type name.
+///
+/// ## Resolution chain (tc = IL2CPP_TYPE_* discriminator)
+/// 1. **Primitives** (0x01–0x10, 0x18–0x19, 0x1C–0x1D): hardcoded lookup.
+/// 2. **VAR** (0x13): generic parameter `!0`, `!1`, … encoded in `data64`.
+/// 3. **ARRAY** (0x14): recursive on element type.
+/// 4. **GENERICINST** (0x15): dumps raw struct bytes (diag-capped) → `System.Generic`.
+/// 5. **CLASS** (0x12) / **VALUETYPE** (0x11):
+///    a. `td_map` — match `data64` as klass pointer, read klass+klass_type_def,
+///       look up the packed type-def index in the pre-built map.
+///    b. `klass_map` — direct pointer lookup (fallback for matches not in td_map).
+///    c. FFI `class_get_name` — dynamic/proxy classes the maps missed.
+///    d. Diag dump of first few MISSING instances (capped), then placeholder.
+/// 6. **Unknown** → `<type:{tc}>`.
+///
+/// All high‑volume arms are sampled at most `diag_cap()` times (normally 5)
+/// to keep log noise manageable.  Set `FROG_DEBUG=1` for full output.
 fn il2cpp_type_name(
     map: &RegionMap, type_ptr: usize,
     type_maps: &TypeMaps,
@@ -135,10 +174,11 @@ fn il2cpp_type_name(
             return "System.Array".into();
         }
         0x15 => {
-            // GENERICINST — data64 points to Il2CppGenericClass.
-            // Log first few raw dumps to figure out the layout.
+            // GENERICINST — data64 points to Il2CppGenericClass. Log a handful of
+            // raw struct dumps so we can fingerprint the layout offline; the rest
+            // are silenced unless `FROG_DEBUG=1`.
             static GEN_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if GEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            if GEN_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < diag_cap() {
                 let mut raw = String::new();
                 let gc_addr = data64 as usize;
                 for off in (0..48).step_by(8) {
@@ -169,8 +209,13 @@ fn il2cpp_type_name(
                     return if ns.is_empty() { cn } else { format!("{}::{}", ns, cn) };
                 }
             }
+            // CLASS/VALUETYPE whose klass_type_def isn't in either map. Most are
+            // benign races (class loaded after we built the map) or generics
+            // mis-tagged as plain class — the FFI fallback above already handled
+            // the resolvable cases. We sample a few for diagnosis and drop the
+            // rest unless the user asked for full debug output.
             static MISSING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if MISSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+            if MISSING.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < diag_cap() {
                 let mut raw = String::new();
                 for off in (0..48).step_by(8) {
                     if let Some(v) = map.read_u64(type_ptr + off) {
@@ -220,6 +265,18 @@ fn build_metadata_index(meta: &Dump) -> HashMap<(String, String), usize> {
 extern "system" fn worker(_param: *mut c_void) -> u32 {
     let _ = write_text(&log_path(), "");
     log("agent loaded");
+
+    // Anti-cheat respect gate — enumerate loaded modules and bail out cleanly
+    // if any known anti-tamper system is present. We never try to bypass these;
+    // running our scanners under EAC/BattlEye/Vanguard would (a) get the user
+    // banned and (b) is explicitly out of scope for this project.
+    let modules = host::enumerate_loaded_modules();
+    if let Some(DeclineReason::AntiCheat(name)) = should_decline(&modules) {
+        log(&format!("declining: anti-cheat present ({}); not engaging", name));
+        log("agent terminated: respect gate");
+        return 0;
+    }
+
     log("=== RAPID CLASS DUMP ===");
 
     // Phase 0: find decrypted global-metadata in memory
@@ -238,14 +295,27 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     });
     let (table_base, table_count) = match table {
         Some(t) => { log(&format!("  table @ {:#x}, {} slots", t.0, t.1)); t }
-        None => { log("  FAILED to locate class table"); return 0; }
+        None => {
+            log("  FAILED to locate class table");
+            log("agent terminated: no class table");
+            return 0;
+        }
     };
-    let api = match unsafe { Il2CppApi::resolve_obfuscated_api() } {
+    let api = match unsafe { Il2CppApi::resolve() } {
         Some(a) => a,
-        None => { log("  FAILED to resolve obfuscated API"); return 0; }
+        None => {
+            log("  FAILED to resolve il2cpp API (neither standard exports nor signature scan succeeded)");
+            log("agent terminated: no il2cpp api");
+            return 0;
+        }
     };
-    let cfg = Il2CppConfig::default();
-    let mut map = RegionMap::capture(8192);
+    let cfg = metadata_result.as_ref()
+        .and_then(|mr| Il2CppConfig::for_metadata_version(mr.version))
+        .unwrap_or_else(Il2CppConfig::default);
+    let ver_str = metadata_result.as_ref().map_or("unknown".into(), |mr| mr.version.to_string());
+    log(&format!("  config: metadata v{}, klass_namespace={:#x}, klass_type_def={:#x}",
+        ver_str, cfg.klass_namespace, cfg.klass_type_def));
+    let mut map = RegionMap::capture(8192); // capture before wait (unused, but ensures regions are mapped)
     log("  waiting 8s for classes to load...");
     std::thread::sleep(Duration::from_secs(8));
     map = RegionMap::capture(8192);
@@ -282,7 +352,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     let mut seen_in_runtime: HashSet<(String, String)> = HashSet::new();
     let mut runtime_field_count = 0usize;
 
-    for i in 0..table_count.min(20000) {
+    for i in 0..table_count.min(Tunables::load().table_max_slots) {
         let a = table_base.wrapping_add(i * cfg.class_table_step);
         if let Some(slot) = map.read_u64(a) {
             let cls = slot as *mut std::ffi::c_void;
@@ -291,19 +361,53 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
             let cns = unsafe { cstr_to_string((api.class_get_namespace)(cls)) };
             let key = (cns.clone(), cname.clone());
 
-            let mut iter: *mut std::ffi::c_void = std::ptr::null_mut();
+            // FFI field enumeration. When `class_get_fields` couldn't be
+            // fingerprinted in this build (obfuscated, no clean prologue), we
+            // skip the per-class field walk and fall back to memory-walking
+            // klass->fields directly below. Class names still come through.
             let mut rt_fields: Vec<(String, String)> = Vec::new();
-            loop {
-                let f = unsafe { (api.class_get_fields)(cls, &mut iter) };
-                if f.is_null() { break; }
-                if rt_fields.len() >= 30 { break; }
-                let fname = unsafe { cstr_to_string((api.field_get_name)(f)) };
-                let ftype_ptr = unsafe { (api.field_get_type)(f) };
-                let ftype = if !ftype_ptr.is_null() {
-                    il2cpp_type_name(&map, ftype_ptr as usize, &type_maps, &cfg, &api)
-                } else { "?".to_string() };
-                rt_fields.push((fname, ftype));
-                runtime_field_count += 1;
+            if let Some(get_fields) = api.class_get_fields {
+                let mut iter: *mut std::ffi::c_void = std::ptr::null_mut();
+                loop {
+                    let f = unsafe { get_fields(cls, &mut iter) };
+                    if f.is_null() { break; }
+                    if rt_fields.len() >= 30 { break; }
+                    let fname = unsafe { cstr_to_string((api.field_get_name)(f)) };
+                    let ftype_ptr = unsafe { (api.field_get_type)(f) };
+                    let ftype = if !ftype_ptr.is_null() {
+                        il2cpp_type_name(&map, ftype_ptr as usize, &type_maps, &cfg, &api)
+                    } else { "?".to_string() };
+                    rt_fields.push((fname, ftype));
+                    runtime_field_count += 1;
+                }
+            } else {
+                // Memory-walk fallback: klass->fields pointer at klass+0x80
+                // (stable across Unity 2017–2022). Each FieldInfo slot is 32
+                // bytes: { name*(8), type*(8), parent*(8), offset(4), token(4) }.
+                // Instead of reading field_count from a version-dependent struct
+                // offset, we scan the array until we hit a null name pointer
+                // (end sentinel) or the cap — this works for ANY Unity version.
+                // All reads go through `map` (bounds-checked) to avoid crashes.
+                let klass = cls as usize;
+                let fields_ptr = map.read_u64(klass + 0x80).unwrap_or(0) as usize;
+                if fields_ptr != 0 {
+                    for fi in 0..256 {
+                        let f = fields_ptr + fi * 32;
+                        let name_ptr = map.read_u64(f).unwrap_or(0) as usize;
+                        if name_ptr == 0 { break; }
+                        let fname = match map.read_name(name_ptr) {
+                            Some(n) => n,
+                            None => break,  // unmapped or non-ASCII → end of array
+                        };
+                        if fname.is_empty() { break; }
+                        let type_ptr = map.read_u64(f + 8).unwrap_or(0) as usize;
+                        let ftype = if type_ptr != 0 {
+                            il2cpp_type_name(&map, type_ptr, &type_maps, &cfg, &api)
+                        } else { "?".to_string() };
+                        rt_fields.push((fname, ftype));
+                        runtime_field_count += 1;
+                    }
+                }
             }
 
             seen_in_runtime.insert(key.clone());
@@ -399,6 +503,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     log(&summary.trim());
     log("  wrote internals.txt");
     log("=== end RAPID CLASS DUMP ===");
+    log("agent terminated: ok");
     0
 }
 

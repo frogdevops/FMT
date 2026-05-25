@@ -4,7 +4,26 @@
 /// version.  This file contains the known version→layout map.  When a version is
 /// unknown the runtime‑detection fallback estimates the layout heuristically.
 ///
-/// Pixel Worlds (Unity 2019.4) uses offsets from the v24 group.
+/// v24 group (Unity 2017–2019) is the reference used for the default layout.
+///
+/// ## Version → Unity mapping
+/// | Metadata version | Unity versions              |
+/// |------------------|-----------------------------|
+/// | v16–v23          | 5.x–2017.x                  |
+/// | v24              | 2018.x–2019.4               |
+/// | v27              | 2020.2–2020.3               |
+/// | v29              | 2021.3                      |
+/// | v30              | 2022.3                      |
+/// | v31              | 6000.x                      |
+///
+/// ## Struct stability notes
+/// The Il2CppClass fields we care about (image, name, namespace, parent, fields)
+/// are at **identical offsets** across all versions ≥ v24.  The only layout change
+/// that affects our config is the `byval_arg` field in Il2CppClass:
+///   - v24–v29: `byval_arg` is an inline `Il2CppType` (16 bytes) at +0x20
+///   - v30+:    `byval_arg` is `Il2CppType*` (pointer, 8 bytes) at +0x20
+/// When it becomes a pointer the type-definition handle moves to the
+/// `typeDefinition`/`typeMetadataHandle` field at +0x68.
 
 #[derive(Debug, Clone)]
 pub struct Il2CppConfig {
@@ -15,8 +34,13 @@ pub struct Il2CppConfig {
     // ── Il2CppClass (klass) ──────────────────────────────────────
     /// Offset from klass to the `namespaze` (`const char*`) field.
     pub klass_namespace: usize,
-    /// Offset from klass to the `typeDefinition` or `byval_arg.data`
-    /// pointer that we use for the reverse type map.
+    /// Offset from klass to a 64‑bit value that uniquely identifies the
+    /// type definition for this klass.
+    ///
+    /// For v24–v29 this is the start of the inline `byval_arg.data` (a
+    /// packed encoding of the type‑definition index).  For v30+ the
+    /// value lives in the `typeDefinition` / `typeMetadataHandle` field
+    /// at +0x68 because `byval_arg` has become a pointer.
     pub klass_type_def: usize,
 
     // ── Il2CppType ───────────────────────────────────────────────
@@ -29,41 +53,107 @@ pub struct Il2CppConfig {
 }
 
 impl Il2CppConfig {
-    /// Default layout determined empirically from Pixel Works
-    /// (Unity 2019.4 / il2cpp metadata v24 group).
+    /// Default layout for the v24 metadata group (Unity 2017–2019).
+    /// These offsets work for the majority of il2cpp games from that era.
     pub const fn default() -> Self {
-        Self {
-            class_table_step:          8,   // x64 pointer width
-
-            klass_namespace:            0x18,
-            klass_type_def:             0x20,
-
-            il2cpp_type_discrim_read_at: 0x08,
-            discrim_shift:              16,
-        }
+        Self::v24()
     }
 
     /// Return a config for a known metadata version, or `None` if the
     /// version is not yet supported.  When `None` the caller should
     /// fall back to `Il2CppConfig::default()` (which will work for
     /// most Unity 2017–2020 games).
-    pub fn for_metadata_version(_version: u32) -> Option<Self> {
-        // Future: match version and produce version-specific offsets.
-        // For now the default layout covers Pixel Worlds / v24 group.
-        match _version {
-            // 24 | 27 => Some(Self::v24()),
-            // 29      => Some(Self::v29()),
-            // 30      => Some(Self::v30()),
+    pub fn for_metadata_version(version: u32) -> Option<Self> {
+        match version {
+            // v24 is the baseline — covers Unity 2017–2019
+            24 | 25 | 26 => Some(Self::v24()),
+            // v27 (Unity 2020.x) — same Il2CppClass layout as v24
+            27 | 28 => Some(Self::v27()),
+            // v29 (Unity 2021.3) — still uses inline byval_arg at +0x20
+            29 => Some(Self::v29()),
+            // v30+ (Unity 2022+) — byval_arg becomes a pointer;
+            // klass_type_def moves to typeDefinition at +0x68.
+            30 | 31 => Some(Self::v30()),
             _ => None,
         }
     }
 
-    // ── Version instances (to be filled as each layout is added) ──
-    //
-    // pub const fn v24() -> Self { ... }
-    // pub const fn v27() -> Self { ... }
-    // pub const fn v29() -> Self { ... }
-    // pub const fn v30() -> Self { ... }
-    //
-    // Reference: Il2CppDumper / MetadataClass.cs + HeaderConstants.cs
+    // ── Version instances ────────────────────────────────────────
+
+    /// v24 baseline — covers Unity 2017–2019 (metadata v24–v26).
+    ///
+    /// Il2CppClass inline layout:
+    ///   +0x00  image           (void*)
+    ///   +0x08  gc_desc         (void*)
+    ///   +0x10  name            (const char*)
+    ///   +0x18  namespaze       (const char*)
+    ///   +0x20  byval_arg       (Il2CppType, 16 bytes inline)
+    ///   +0x30  this_arg        (Il2CppType, 16 bytes inline)
+    ///   …
+    ///   +0x58  parent          (Il2CppClass*)
+    ///   +0x68  typeDefinition  (void*)
+    ///
+    /// Il2CppType:
+    ///   +0x00  data            (8 bytes — packed typeDefIndex + flags)
+    ///   +0x08  attrs / type    (u32 — discriminator at byte 2)
+    const fn v24() -> Self {
+        Self {
+            class_table_step:           8,
+            klass_namespace:            0x18,
+            klass_type_def:             0x20,   // byval_arg.data (inline)
+            il2cpp_type_discrim_read_at: 0x08,
+            discrim_shift:              16,
+        }
+    }
+
+    /// v27 — Unity 2020.x (metadata v27–v28).
+    ///
+    /// Identical Il2CppClass / Il2CppType layout to v24.  No runtime
+    /// struct changes affected the fields we use.
+    const fn v27() -> Self {
+        Self {
+            class_table_step:           8,
+            klass_namespace:            0x18,
+            klass_type_def:             0x20,   // byval_arg.data (inline)
+            il2cpp_type_discrim_read_at: 0x08,
+            discrim_shift:              16,
+        }
+    }
+
+    /// v29 — Unity 2021.3 (metadata v29).
+    ///
+    /// Identical Il2CppClass / Il2CppType layout to v24.  The
+    /// `typeDefinition` field was renamed `typeMetadataHandle` but
+    /// remains at +0x68 and `byval_arg` is still inline at +0x20.
+    const fn v29() -> Self {
+        Self {
+            class_table_step:           8,
+            klass_namespace:            0x18,
+            klass_type_def:             0x20,   // byval_arg.data (inline)
+            il2cpp_type_discrim_read_at: 0x08,
+            discrim_shift:              16,
+        }
+    }
+
+    /// v30 — Unity 2022.x (metadata v30–v31).
+    ///
+    /// **Known change**: `byval_arg` / `this_arg` became pointers
+    /// (`Il2CppType*`) instead of inline structs.  Offset 0x20 now
+    /// holds a pointer to the `Il2CppType` rather than the type data
+    /// itself.  The type‑definition handle moves to the
+    /// `typeDefinition`/`typeMetadataHandle` field at +0x68.
+    ///
+    /// ⚠  This variant uses `klass_type_def = 0x68` to read the
+    /// type‑definition handle.  **Empirically untested** — if you hit
+    /// a metadata v30 game and types come out wrong, this is the
+    /// first offset to verify.
+    const fn v30() -> Self {
+        Self {
+            class_table_step:           8,
+            klass_namespace:            0x18,
+            klass_type_def:             0x68,   // typeDefinition / typeMetadataHandle (void*)
+            il2cpp_type_discrim_read_at: 0x08,
+            discrim_shift:              16,
+        }
+    }
 }

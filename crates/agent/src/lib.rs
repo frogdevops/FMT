@@ -6,3 +6,5 @@ mod il2cpp_config;
 mod entry;
 #[cfg(target_os = "windows")]
 mod mem_scan;
+#[cfg(target_os = "windows")]
+mod host;

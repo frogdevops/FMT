@@ -79,6 +79,11 @@ pub fn scan_process_for_metadata() -> Option<MetadataResult> {
 /// Diagnostic: find every metadata-magic marker in committed/readable memory and
 /// return (absolute_address, version) for each (version = the u32 at the marker's
 /// byte offset +4). Capped to avoid log spam. Read-only.
+///
+/// Not on the current dump path — retained for the upcoming TCP query layer so
+/// the IDE plugin can ask "how many metadata blob candidates are live in this
+/// process?" for triage on unknown games.
+#[allow(dead_code)]
 pub fn scan_metadata_candidates() -> Vec<(usize, u32)> {
     const CAP: usize = 64;
     let mut out = Vec::new();
@@ -129,6 +134,10 @@ pub fn scan_metadata_candidates() -> Vec<(usize, u32)> {
 /// Module-backed memory is reliably readable (unlike arbitrary heap/mapped regions
 /// that can fault), and the "global-metadata.dat" literal lives in the module's
 /// data. Read-only. Caps per needle.
+///
+/// Retained for IDE-plugin queries (e.g. locating string literals in the binary
+/// for hook anchoring); not on the current dump path.
+#[allow(dead_code)]
 pub fn scan_gameassembly_for_strings(needles: &[&str]) -> Vec<(String, usize)> {
     const PER_NEEDLE_CAP: usize = 16;
     let mut out = Vec::new();
@@ -204,8 +213,13 @@ pub fn scan_gameassembly_for_strings(needles: &[&str]) -> Vec<(String, usize)> {
 /// Results are deduped by class pointer, so we capture every loaded class no
 /// matter how many places reference it. NEVER dereferences an address that isn't
 /// proven inside a committed, readable region. Never calls into the game.
+///
+/// Standalone variant of `find_class_table` — useful when the table itself is
+/// fragmented or relocated. Kept for the IDE plugin's "force a full memory
+/// rescan" command.
+#[allow(dead_code)]
 pub fn scan_for_classes(cap: usize) -> Vec<(String, String)> {
-    const MAX_REGIONS: usize = 8192;
+    let tunables = Tunables::load();
 
     // --- Step 1: build a sorted map of committed, readable regions. ---
     let mut regions: Vec<(usize, usize)> = Vec::new();
@@ -227,7 +241,7 @@ pub fn scan_for_classes(cap: usize) -> Vec<(String, String)> {
 
             if mbi.State == MEM_COMMIT && is_readable(mbi.Protect) && size >= 8 {
                 regions.push((base, next));
-                if regions.len() >= MAX_REGIONS {
+                if regions.len() >= tunables.max_regions {
                     break;
                 }
             }
@@ -328,22 +342,17 @@ pub fn scan_for_classes(cap: usize) -> Vec<(String, String)> {
     // --- Step 3: scan every slot, validate as an image-anchored class pointer,
     // and dedup by class pointer — captures every loaded class regardless of
     // table layout or how many places reference it. ---
-    const SLOT_BUDGET: u64 = 250_000_000;
-    // Reading every committed region faults under Wine (some mapped regions report
-    // readable but throw on access). The il2cpp metadata heap sits in the first
-    // regions, so bound the scan — this is the known crash-safe envelope.
-    const MAX_SCAN_REGIONS: usize = 64;
     let mut results: Vec<(String, String)> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
     let mut slots_scanned: u64 = 0;
 
     'outer: for (ri, &(start, end)) in regions.iter().enumerate() {
-        if ri >= MAX_SCAN_REGIONS {
+        if ri >= tunables.max_scan_regions {
             break;
         }
         let mut a = start;
         while a + 8 <= end {
-            if slots_scanned >= SLOT_BUDGET || results.len() >= cap {
+            if slots_scanned >= tunables.slot_budget || results.len() >= cap {
                 break 'outer;
             }
             slots_scanned += 1;
@@ -365,6 +374,10 @@ pub fn scan_for_classes(cap: usize) -> Vec<(String, String)> {
 
 /// Diagnostic: search committed/readable memory for each needle string and
 /// return (needle, absolute_address) for every hit, capped. Read-only.
+///
+/// Used by the IDE plugin for ad-hoc "find this string in process memory"
+/// queries (e.g. locating a known PlayFab URL, an asset path, a token).
+#[allow(dead_code)]
 pub fn scan_for_strings(needles: &[&str]) -> Vec<(String, usize)> {
     const PER_NEEDLE_CAP: usize = 16;
     let mut out = Vec::new();
@@ -484,7 +497,8 @@ impl RegionMap {
     }
 
     /// NUL-terminated printable-ASCII string (<= 63 chars) at `addr`, or None.
-    fn read_name(&self, addr: usize) -> Option<String> {
+    /// Bounds-checked via `in_region`; safe to call on any address.
+    pub fn read_name(&self, addr: usize) -> Option<String> {
         if !self.in_region(addr, 64) {
             return None;
         }
@@ -535,19 +549,54 @@ impl RegionMap {
     }
 }
 
+/// Tunable scan parameters, overrideable via `FROG_*` environment variables.
+///
+/// | Env var                         | Default          | Purpose                        |
+/// |---------------------------------|------------------|--------------------------------|
+/// | `FROG_MAX_REGIONS`              | 8192             | Region‑capture budget          |
+/// | `FROG_MAX_SCAN_REGIONS`         | 64               | Crash‑safe scan envelope       |
+/// | `FROG_SLOT_BUDGET`              | 250_000_000      | Max slots to scan              |
+/// | `FROG_MIN_CLASSES`              | 64               | Min classes to accept a run    |
+/// | `FROG_TABLE_MAX_SLOTS`          | 20000            | Max class‑table slots to read  |
+pub struct Tunables {
+    pub max_regions: usize,
+    pub max_scan_regions: usize,
+    pub slot_budget: u64,
+    pub min_classes: usize,
+    pub table_max_slots: usize,
+}
+
+impl Tunables {
+    fn from_env(name: &str, default: usize) -> usize {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    fn from_env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    }
+
+    pub fn load() -> Self {
+        Self {
+            max_regions:      Self::from_env("FROG_MAX_REGIONS", 8192),
+            max_scan_regions: Self::from_env("FROG_MAX_SCAN_REGIONS", 64),
+            slot_budget:      Self::from_env_u64("FROG_SLOT_BUDGET", 250_000_000),
+            min_classes:      Self::from_env("FROG_MIN_CLASSES", 64),
+            table_max_slots:  Self::from_env("FROG_TABLE_MAX_SLOTS", 20000),
+        }
+    }
+}
+
 /// Locate il2cpp's class table (`s_TypeInfoTable`) ONCE: the densest contiguous
 /// array of slots that are each either NULL (an unloaded type) or a pointer to a
 /// class-shaped struct. Returns `(base_addr, slot_count)` of the best run, or
 /// None. Bounded to the crash-safe region envelope; adjacent sub-regions are
 /// coalesced so a table split across them stays one run.
 pub fn find_class_table() -> Option<(usize, usize)> {
-    const MAX_REGIONS: usize = 8192;
-    const MAX_SCAN_REGIONS: usize = 64;
-    const MIN_CLASSES: usize = 64;
-    let map = RegionMap::capture(MAX_REGIONS);
+    let tunables = Tunables::load();
+    let map = RegionMap::capture(tunables.max_regions);
 
     let mut merged: Vec<(usize, usize)> = Vec::new();
-    for &(s, e) in map.regions.iter().take(MAX_SCAN_REGIONS) {
+    for &(s, e) in map.regions.iter().take(tunables.max_scan_regions) {
         if let Some(last) = merged.last_mut() {
             if last.1 == s {
                 last.1 = e;
@@ -580,7 +629,7 @@ pub fn find_class_table() -> Option<(usize, usize)> {
                     run_classes += 1;
                 }
             } else if in_run {
-                if run_classes >= MIN_CLASSES && best.map_or(true, |(_, _, bc)| run_classes > bc) {
+                if run_classes >= tunables.min_classes && best.map_or(true, |(_, _, bc)| run_classes > bc) {
                     best = Some((run_start, run_slots, run_classes));
                 }
                 in_run = false;
@@ -588,7 +637,7 @@ pub fn find_class_table() -> Option<(usize, usize)> {
             a += 8;
         }
         if in_run
-            && run_classes >= MIN_CLASSES
+            && run_classes >= tunables.min_classes
             && best.map_or(true, |(_, _, bc)| run_classes > bc)
         {
             best = Some((run_start, run_slots, run_classes));
@@ -678,9 +727,14 @@ pub fn find_types_array(type_count: u32, map: &RegionMap) -> Option<usize> {
 /// Re-read a located class table: walk `count` slots from `base` and collect
 /// (name, namespace) for every slot that points to a class-shaped struct. Cheap
 /// relative to a full scan — this is the per-tick "watch" read. Read-only.
+///
+/// Designed for the upcoming IDE plugin's live-class-list view: call this every
+/// N seconds with the cached (base, count) from `find_class_table` to refresh
+/// the loaded-class set without redoing the full memory walk.
+#[allow(dead_code)]
 pub fn read_class_table(base: usize, count: usize) -> Vec<(String, String)> {
-    const MAX_REGIONS: usize = 8192;
-    let map = RegionMap::capture(MAX_REGIONS);
+    let tunables = Tunables::load();
+    let map = RegionMap::capture(tunables.max_regions);
     let mut out = Vec::new();
     let mut i = 0usize;
     while i < count {
