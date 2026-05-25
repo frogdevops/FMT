@@ -246,11 +246,11 @@ fn format_class(c: &DumpedClass, fields: &[String]) -> Vec<String> {
     out
 }
 
-fn field_line(name: &str, type_name: &str) -> String {
+fn field_line(name: &str, type_name: &str, offset: u32, token: u32) -> String {
     if type_name.is_empty() {
-        format!("    {}: <?>", name)
+        format!("    {}: <?> // Offset: {:#x}, Token: {:#x}", name, offset, token)
     } else {
-        format!("    {}: {}", name, type_name)
+        format!("    {}: {} // Offset: {:#x}, Token: {:#x}", name, type_name, offset, token)
     }
 }
 
@@ -365,7 +365,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
             // fingerprinted in this build (obfuscated, no clean prologue), we
             // skip the per-class field walk and fall back to memory-walking
             // klass->fields directly below. Class names still come through.
-            let mut rt_fields: Vec<(String, String)> = Vec::new();
+            let mut rt_fields: Vec<(String, String, u32, u32)> = Vec::new();
             if let Some(get_fields) = api.class_get_fields {
                 let mut iter: *mut std::ffi::c_void = std::ptr::null_mut();
                 loop {
@@ -377,7 +377,9 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                     let ftype = if !ftype_ptr.is_null() {
                         il2cpp_type_name(&map, ftype_ptr as usize, &type_maps, &cfg, &api)
                     } else { "?".to_string() };
-                    rt_fields.push((fname, ftype));
+                    let offset = map.read_u32(f as usize + 24).unwrap_or(0);
+                    let token = map.read_u32(f as usize + 28).unwrap_or(0);
+                    rt_fields.push((fname, ftype, offset, token));
                     runtime_field_count += 1;
                 }
             } else {
@@ -404,7 +406,9 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                         let ftype = if type_ptr != 0 {
                             il2cpp_type_name(&map, type_ptr, &type_maps, &cfg, &api)
                         } else { "?".to_string() };
-                        rt_fields.push((fname, ftype));
+                        let offset = map.read_u32(f + 24).unwrap_or(0);
+                        let token = map.read_u32(f + 28).unwrap_or(0);
+                        rt_fields.push((fname, ftype, offset, token));
                         runtime_field_count += 1;
                     }
                 }
@@ -435,20 +439,20 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                     let dump = &metadata_result.as_ref().unwrap().dump;
                     let meta_class = &dump.classes[ci];
                     let mut fields: Vec<String> = Vec::new();
-                    let rt_lookup: HashMap<&str, &str> = rt_fields.iter()
-                        .map(|(n, t)| (n.as_str(), t.as_str())).collect();
-                    let is_missing = |s: &str| s == "System.ValueType" || s == "System.Object" || s == "?" || s.is_empty();
+                    let rt_lookup: HashMap<&str, (String, u32, u32)> = rt_fields.iter()
+                        .map(|(n, t, o, tk)| (n.as_str(), (t.clone(), *o, *tk))).collect();
                     for mf in &meta_class.fields {
-                        let tn = mf.type_index.and_then(|ti| {
-                                let r = type_from_idx(ti);
-                                if r.is_empty() { None } else { Some(r) }
+                        let (tn, off, tk) = rt_lookup.get(mf.name.as_str())
+                            .map(|(t, o, tk)| {
+                                let resolved_type = mf.type_index.and_then(|ti| {
+                                        let r = type_from_idx(ti);
+                                        if r.is_empty() { None } else { Some(r) }
+                                     })
+                                     .unwrap_or_else(|| t.clone());
+                                (resolved_type, *o, *tk)
                             })
-                            .or_else(|| {
-                                let rt = rt_lookup.get(mf.name.as_str())?;
-                                if is_missing(rt) { None } else { Some((*rt).to_string()) }
-                            })
-                            .unwrap_or_else(|| "<?>".to_string());
-                        fields.push(field_line(&mf.name, &tn));
+                            .unwrap_or_else(|| ("<?>".to_string(), 0, 0));
+                        fields.push(field_line(&mf.name, &tn, off, tk));
                     }
                     all_lines.extend(format_class(meta_class, &fields));
                     continue;
@@ -457,8 +461,8 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
 
             if !rt_fields.is_empty() {
                 let mut fields: Vec<String> = Vec::new();
-                for (fn_, ft) in &rt_fields {
-                    fields.push(field_line(fn_, ft));
+                for (fn_, ft, off, tk) in &rt_fields {
+                    fields.push(field_line(fn_, ft, *off, *tk));
                 }
                 let full = if cns.is_empty() { cname } else { format!("{}::{}", cns, cname) };
                 all_lines.push(format!("{} ({} fields):", full, fields.len()));
@@ -486,7 +490,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
                             if ns.is_empty() { cn.clone() } else { format!("{}::{}", ns, cn) }
                         })
                     }).unwrap_or_else(|| "<?>".to_string());
-                    field_line(&f.name, &tn)
+                    field_line(&f.name, &tn, 0, 0)
                 }).collect();
                 all_lines.extend(format_class(c, &fields));
                 meta_only += 1;

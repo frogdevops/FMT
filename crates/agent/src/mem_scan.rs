@@ -496,6 +496,14 @@ impl RegionMap {
         }
     }
 
+    pub fn read_u32(&self, addr: usize) -> Option<u32> {
+        if self.in_region(addr, 4) {
+            Some(unsafe { *(addr as *const u32) })
+        } else {
+            None
+        }
+    }
+
     /// NUL-terminated printable-ASCII string (<= 63 chars) at `addr`, or None.
     /// Bounds-checked via `in_region`; safe to call on any address.
     pub fn read_name(&self, addr: usize) -> Option<String> {
