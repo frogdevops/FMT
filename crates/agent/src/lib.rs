@@ -16,3 +16,9 @@ mod region_map;
 mod type_resolve;
 #[cfg(target_os = "windows")]
 mod dump_writer;
+#[cfg(target_os = "windows")]
+mod hook;
+#[cfg(target_os = "windows")]
+mod bson;
+#[cfg(target_os = "windows")]
+mod packet;

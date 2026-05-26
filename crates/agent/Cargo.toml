@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 agent-core = { path = "../agent-core" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+iced-x86 = { version = "1.21", default-features = false, features = ["decoder", "no_std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -22,6 +23,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemServices",
     "Win32_System_Memory",
     "Win32_System_ProcessStatus",
+    "Win32_Networking_WinSock",
 ] }
 
 

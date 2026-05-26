@@ -140,16 +140,38 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     log(summary.trim());
     log("  wrote internals.txt");
     log("=== end RAPID CLASS DUMP ===");
-    log("agent terminated: ok");
-    0
+
+    // Start TCP server
+    crate::packet::start_tcp_server();
+
+    // Install packet hooks
+    unsafe {
+        crate::packet::install_packet_hooks();
+    }
+
+    log("agent running: packet hooks and TCP server active");
+
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
+
+const DLL_PROCESS_DETACH: u32 = 0;
 
 #[no_mangle]
 pub extern "system" fn DllMain(_module: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
-    if reason == DLL_PROCESS_ATTACH {
-        unsafe {
-            CreateThread(ptr::null(), 0, Some(worker), ptr::null(), 0, ptr::null_mut());
+    match reason {
+        DLL_PROCESS_ATTACH => {
+            unsafe {
+                CreateThread(ptr::null(), 0, Some(worker), ptr::null(), 0, ptr::null_mut());
+            }
         }
+        DLL_PROCESS_DETACH => {
+            unsafe {
+                crate::packet::remove_packet_hooks();
+            }
+        }
+        _ => {}
     }
     TRUE
 }
