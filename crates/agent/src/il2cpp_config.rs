@@ -19,11 +19,14 @@
 /// ## Struct stability notes
 /// The Il2CppClass fields we care about (image, name, namespace, parent, fields)
 /// are at **identical offsets** across all versions ≥ v24.  The only layout change
-/// that affects our config is the `byval_arg` field in Il2CppClass:
-///   - v24–v29: `byval_arg` is an inline `Il2CppType` (16 bytes) at +0x20
-///   - v30+:    `byval_arg` is `Il2CppType*` (pointer, 8 bytes) at +0x20
-/// When it becomes a pointer the type-definition handle moves to the
-/// `typeDefinition`/`typeMetadataHandle` field at +0x68.
+/// that affects our config is the `byval_arg` / `this_arg` fields in Il2CppClass:
+///   - v24–v29: `byval_arg` / `this_arg` are inline `Il2CppType` (16 bytes each) at
+///              +0x20 / +0x30
+///   - v30+:    `byval_arg` / `this_arg` are `Il2CppType*` (pointer, 8 bytes each)
+///              at +0x20 / +0x28
+/// When they become pointers the type-definition handle moves to the
+/// `typeDefinition` / `typeMetadataHandle` field at +0x68, and every field at
+/// +0x30 or later shifts forward by 16 bytes.
 
 #[derive(Debug, Clone)]
 pub struct Il2CppConfig {
@@ -42,6 +45,17 @@ pub struct Il2CppConfig {
     /// value lives in the `typeDefinition` / `typeMetadataHandle` field
     /// at +0x68 because `byval_arg` has become a pointer.
     pub klass_type_def: usize,
+    /// Offset from klass to the `Il2CppGenericClass*` pointer.  Used to
+    /// read the generic context (concrete type arguments) when resolving
+    /// VAR/MVAR generic parameters to their instantiated types.
+    ///
+    ///   v24–v29: +0x48 (after element_class at +0x40)
+    ///   v30+:    +0x38 (shifted by -16 because byval/this are pointers)
+    pub klass_generic_class: usize,
+    /// Offset from klass to the `FieldInfo*` pointer (the `fields` array
+    /// used by the memory-walk fallback).  +0x80 is stable for v24–v30;
+    /// v30+ shifts this to +0x70.
+    pub klass_fields: usize,
 
     // ── Il2CppType ───────────────────────────────────────────────
     /// Byte offset to read an 8‑byte (u64) chunk from an Il2CppType
@@ -98,62 +112,53 @@ impl Il2CppConfig {
     ///   +0x08  attrs / type    (u32 — discriminator at byte 2)
     const fn v24() -> Self {
         Self {
-            class_table_step:           8,
-            klass_namespace:            0x18,
-            klass_type_def:             0x20,   // byval_arg.data (inline)
+            class_table_step:            8,
+            klass_namespace:             0x18,
+            klass_type_def:              0x20,   // byval_arg.data (inline)
+            klass_generic_class:         0x48,
+            klass_fields:                0x80,
             il2cpp_type_discrim_read_at: 0x08,
-            discrim_shift:              16,
+            discrim_shift:               16,
         }
     }
 
     /// v27 — Unity 2020.x (metadata v27–v28).
     ///
-    /// Identical Il2CppClass / Il2CppType layout to v24.  No runtime
-    /// struct changes affected the fields we use.
+    /// Identical Il2CppClass layout to v24.  No runtime struct changes.
     const fn v27() -> Self {
-        Self {
-            class_table_step:           8,
-            klass_namespace:            0x18,
-            klass_type_def:             0x20,   // byval_arg.data (inline)
-            il2cpp_type_discrim_read_at: 0x08,
-            discrim_shift:              16,
-        }
+        Self::v24()
     }
 
     /// v29 — Unity 2021.3 (metadata v29).
     ///
-    /// Identical Il2CppClass / Il2CppType layout to v24.  The
-    /// `typeDefinition` field was renamed `typeMetadataHandle` but
-    /// remains at +0x68 and `byval_arg` is still inline at +0x20.
+    /// Identical Il2CppClass layout to v24.  The `typeDefinition` field
+    /// was renamed `typeMetadataHandle` but remains at +0x68 and
+    /// `byval_arg` is still inline at +0x20.
     const fn v29() -> Self {
-        Self {
-            class_table_step:           8,
-            klass_namespace:            0x18,
-            klass_type_def:             0x20,   // byval_arg.data (inline)
-            il2cpp_type_discrim_read_at: 0x08,
-            discrim_shift:              16,
-        }
+        Self::v24()
     }
 
     /// v30 — Unity 2022.x (metadata v30–v31).
     ///
     /// **Known change**: `byval_arg` / `this_arg` became pointers
-    /// (`Il2CppType*`) instead of inline structs.  Offset 0x20 now
-    /// holds a pointer to the `Il2CppType` rather than the type data
-    /// itself.  The type‑definition handle moves to the
-    /// `typeDefinition`/`typeMetadataHandle` field at +0x68.
+    /// (`Il2CppType*`) instead of inline structs (16 bytes → 8 bytes
+    /// each).  This shifts every field at +0x30 + by −16 bytes.
+    ///   - `klass_type_def` → +0x68 (typeDefinition / typeMetadataHandle)
+    ///   - `klass_generic_class` → +0x38 (was +0x48)
+    ///   - `klass_fields` → +0x70 (was +0x80)
     ///
-    /// ⚠  This variant uses `klass_type_def = 0x68` to read the
-    /// type‑definition handle.  **Empirically untested** — if you hit
-    /// a metadata v30 game and types come out wrong, this is the
-    /// first offset to verify.
+    /// ⚠  All v30+ offsets are deduced from the size change, not
+    /// empirically verified.  If you hit a metadata v30+ game and
+    /// output is wrong, these are the offsets to check first.
     const fn v30() -> Self {
         Self {
-            class_table_step:           8,
-            klass_namespace:            0x18,
-            klass_type_def:             0x68,   // typeDefinition / typeMetadataHandle (void*)
+            class_table_step:            8,
+            klass_namespace:             0x18,
+            klass_type_def:              0x68,   // typeDefinition / typeMetadataHandle
+            klass_generic_class:         0x38,   // guessed (shifted by −16)
+            klass_fields:                0x70,   // guessed (shifted by −16)
             il2cpp_type_discrim_read_at: 0x08,
-            discrim_shift:              16,
+            discrim_shift:               16,
         }
     }
 }

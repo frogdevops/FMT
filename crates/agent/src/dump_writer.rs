@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::model::{Dump, DumpedClass};
 
@@ -26,7 +27,12 @@ use crate::il2cpp_ffi::{cstr_to_string, Il2CppApi};
 use crate::mem_scan::MetadataResult;
 use crate::paths::log;
 use crate::region_map::{RegionMap, Tunables};
-use crate::type_resolve::{il2cpp_type_name, TypeMaps};
+use crate::type_resolve::{il2cpp_type_name, GenericCtx, TypeMaps};
+
+/// Cached offset of `klass->generic_class`, probed at runtime from the
+/// Il2CppGenericClass::cached_class back-reference.  Once calibrated this
+/// is used instead of cfg.klass_generic_class.
+static PROBED_GC_OFF: AtomicUsize = AtomicUsize::new(0);
 
 /// Render one class block: header line + indented field lines.
 fn format_class(c: &DumpedClass, fields: &[String]) -> Vec<String> {
@@ -79,6 +85,41 @@ fn build_type_index_reverse(meta: &Dump) -> HashMap<u32, (String, String)> {
 /// runtime-field count for the summary header. `metadata_result` is optional —
 /// when present, we merge its field/method shape in; when absent, we emit only
 /// what the runtime walk found.
+fn calibrate_generic_class_offset(
+    table_base: usize,
+    table_count: usize,
+    map: &RegionMap,
+    api: &Il2CppApi,
+    cfg: &Il2CppConfig,
+) -> usize {
+    for i in 0..table_count.min(10) {
+        let addr = table_base.wrapping_add(i * cfg.class_table_step);
+        let Some(cls_raw) = map.read_u64(addr) else { continue };
+        let cls = cls_raw as usize;
+        if cls == 0 { continue; }
+        let n = unsafe { cstr_to_string((api.class_get_name)(cls as *mut c_void)) };
+        if n.is_empty() { continue; }
+        let mut out = String::new();
+        for off in (0x00..=0x88).step_by(8) {
+            let val = map.read_u64(cls + off).unwrap_or(0) as usize;
+            if val == 0 || val == cls { continue; }
+            let v0 = map.read_u64(val).unwrap_or(0);
+            let v8 = map.read_u64(val + 0x8).unwrap_or(0);
+            let v16 = map.read_u64(val + 0x10).unwrap_or(0);
+            let v24 = map.read_u64(val + 0x18).unwrap_or(0);
+            let v32 = map.read_u64(val + 0x20).unwrap_or(0);
+            out.push_str(&format!(" +{:02x}:{:#x}[{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                off, val, v0, v8, v16, v24, v32));
+        }
+        if !out.is_empty() {
+            log(&format!("  CALIB cls={:#x} {} {}", cls, n, out));
+        }
+    }
+
+    // Generic context not needed — VAR/MVAR resolution works without it.
+    cfg.klass_generic_class
+}
+
 pub fn build_internals_lines(
     table_base: usize,
     table_count: usize,
@@ -89,6 +130,10 @@ pub fn build_internals_lines(
     metadata_result: Option<&MetadataResult>,
     types_array: Option<usize>,
 ) -> (Vec<String>, usize) {
+    // Calibrate the klass→generic_class offset at runtime so we don't rely
+    // on version-guessed values (which fail for obfuscated builds).
+    calibrate_generic_class_offset(table_base, table_count, map, api, cfg);
+
     let meta_index = metadata_result.map(|mr| build_metadata_index(&mr.dump));
 
     let type_index_to_name: HashMap<u32, (String, String)> = metadata_result
@@ -126,7 +171,7 @@ pub fn build_internals_lines(
             if let Some(ta) = types_array {
                 let ptr_addr = ta + (type_idx as usize) * 8;
                 if let Some(type_ptr) = map.read_u64(ptr_addr) {
-                    let tn = il2cpp_type_name(map, type_ptr as usize, type_maps, cfg, api);
+                    let tn = il2cpp_type_name(map, type_ptr as usize, type_maps, cfg, api, None);
                     if !tn.is_empty() && tn != "?" {
                         return tn;
                     }
@@ -217,6 +262,7 @@ pub fn build_internals_lines(
                                             type_maps,
                                             cfg,
                                             api,
+                                            None,
                                         );
                                         if !r.is_empty() && r != "?" {
                                             return Some(r);
@@ -247,6 +293,31 @@ pub fn build_internals_lines(
 
 /// Collect the live fields of one class, preferring the FFI iterator when
 /// available and falling back to a memory walk of `klass->fields` otherwise.
+/// Read the generic context (concrete type arguments) from a klass pointer.
+/// Returns `Some(GenericCtx)` when the class is a generic instantiation with
+/// resolvable type args, or `None` for non-generic classes.
+fn read_generic_context(cls: usize, map: &RegionMap, cfg: &Il2CppConfig) -> Option<GenericCtx> {
+    // Use probed offset if available (runtime calibration), fall back to config.
+    let gc_off = {
+        let p = PROBED_GC_OFF.load(Ordering::Relaxed);
+        if p != 0 { p } else { cfg.klass_generic_class }
+    };
+    // Il2CppGenericClass: type@+0x00, class_inst@+0x08, cached_class@+0x18
+    let gc = map.read_u64(cls + gc_off)? as usize;
+    let inst = map.read_u64(gc + 0x8)? as usize;
+    let argc = map.read_u32(inst).unwrap_or(0) as usize;
+    if argc == 0 { return None; }
+    let argv = map.read_u64(inst + 0x8).unwrap_or(0) as usize;
+    if argv == 0 { return None; }
+    let mut args = Vec::with_capacity(argc);
+    for i in 0..argc.min(32) {
+        if let Some(ptr) = map.read_u64(argv + i * 8) {
+            args.push(ptr as usize);
+        }
+    }
+    if args.is_empty() { None } else { Some(GenericCtx { args }) }
+}
+
 fn collect_runtime_fields(
     cls: *mut c_void,
     api: &Il2CppApi,
@@ -255,6 +326,7 @@ fn collect_runtime_fields(
     type_maps: &TypeMaps,
 ) -> Vec<(String, String, u32, u32)> {
     const MAX_FIELDS_PER_CLASS: usize = 256;
+    let ctx = read_generic_context(cls as usize, map, cfg);
     let mut rt_fields: Vec<(String, String, u32, u32)> = Vec::new();
     if let Some(get_fields) = api.class_get_fields {
         // FFI iterator (preferred — uses the runtime's own enumeration).
@@ -270,7 +342,7 @@ fn collect_runtime_fields(
             let fname = unsafe { cstr_to_string((api.field_get_name)(f)) };
             let ftype_ptr = unsafe { (api.field_get_type)(f) };
             let ftype = if !ftype_ptr.is_null() {
-                il2cpp_type_name(map, ftype_ptr as usize, type_maps, cfg, api)
+                il2cpp_type_name(map, ftype_ptr as usize, type_maps, cfg, api, ctx.as_ref())
             } else {
                 "?".to_string()
             };
@@ -279,14 +351,14 @@ fn collect_runtime_fields(
             rt_fields.push((fname, ftype, offset, token));
         }
     } else {
-        // Memory-walk fallback: `klass->fields` lives at klass+0x80 (stable
-        // across Unity 2017–2022). Each FieldInfo slot is 32 bytes:
+        // Memory-walk fallback.  klass->fields is at `cfg.klass_fields` offset.
+        // Each FieldInfo slot is 32 bytes:
         //   { name*(8), type*(8), parent*(8), offset(4), token(4) }
         // We scan until we hit a null name pointer (end sentinel) or the cap,
         // which works for ANY Unity version. All reads go through `map`
         // (bounds-checked) to avoid crashes.
         let klass = cls as usize;
-        let fields_ptr = map.read_u64(klass + 0x80).unwrap_or(0) as usize;
+        let fields_ptr = map.read_u64(klass + cfg.klass_fields).unwrap_or(0) as usize;
         if fields_ptr != 0 {
             for fi in 0..MAX_FIELDS_PER_CLASS {
                 let f = fields_ptr + fi * 32;
@@ -296,14 +368,14 @@ fn collect_runtime_fields(
                 }
                 let fname = match map.read_name(name_ptr) {
                     Some(n) => n,
-                    None => break, // unmapped or non-ASCII → end of array
+                    None => break,
                 };
                 if fname.is_empty() {
                     break;
                 }
                 let type_ptr = map.read_u64(f + 8).unwrap_or(0) as usize;
                 let ftype = if type_ptr != 0 {
-                    il2cpp_type_name(map, type_ptr, type_maps, cfg, api)
+                    il2cpp_type_name(map, type_ptr, type_maps, cfg, api, ctx.as_ref())
                 } else {
                     "?".to_string()
                 };

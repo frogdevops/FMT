@@ -3,8 +3,10 @@
 //! The runtime never stores type names in plain text on the type itself; you
 //! have to walk through one of:
 //!   * the primitives table (compiled in below),
-//!   * the type-def map built from the class table at startup, or
-//!   * `class_get_name` via FFI as a last resort.
+//!   * the type-def map built from the class table at startup,
+//!   * `class_get_name` via FFI as a last resort, or
+//!   * the generic context (type args from `Il2CppGenericInst`) to resolve
+//!     VAR/MVAR generic parameters to their instantiated types.
 //!
 //! This module owns the name-resolution chain and the per-class lookup tables
 //! that feed it. Everything is read-only and bounds-checked through `RegionMap`.
@@ -16,6 +18,17 @@ use crate::il2cpp_config::Il2CppConfig;
 use crate::il2cpp_ffi::{cstr_to_string, Il2CppApi};
 use crate::paths::log;
 use crate::region_map::{RegionMap, Tunables};
+
+/// Generic context for resolving VAR/MVAR type parameters.
+///
+/// Carries the concrete type arguments for a generic class instantiation
+/// (the `Il2CppGenericInst.argv` array). When the class has no generic
+/// context (is not a generic instantiation), this is empty and VAR/MVAR
+/// fall back to printing `!<index>`.
+pub struct GenericCtx {
+    /// Pointers to `Il2CppType*` for each concrete type argument.
+    pub args: Vec<usize>,
+}
 
 /// Two lookup strategies:
 /// - `td_map`: keyed by `klass + klass_type_def` value (packed typeDefIndex + flags)
@@ -153,28 +166,62 @@ fn strip_arity(name: &str) -> String {
 /// Resolve an `Il2CppType*` to a human-readable type name.
 ///
 /// ## Resolution chain (tc = IL2CPP_TYPE_* discriminator)
-/// 1. **Primitives** (0x01–0x10, 0x18–0x19, 0x1C–0x1D): hardcoded lookup.
-/// 2. **VAR** (0x13): generic parameter `!0`, `!1`, … encoded in `data64`.
-/// 3. **ARRAY** (0x14): recursive on element type.
-/// 4. **GENERICINST** (0x15): dumps raw struct bytes (diag-capped) → `System.Generic`.
-/// 5. **CLASS** (0x12) / **VALUETYPE** (0x11):
-///    a. `td_map` — match `data64` as klass pointer, read klass+klass_type_def,
-///       look up the packed type-def index in the pre-built map.
-///    b. `klass_map` — direct pointer lookup (fallback for matches not in td_map).
-///    c. FFI `class_get_name` — dynamic/proxy classes the maps missed.
-///    d. Diag dump of first few MISSING instances (capped), then placeholder.
-/// 6. **Unknown** → `<type:{tc}>`.
-///
-/// All high-volume arms are sampled at most `diag_cap()` times (normally 5)
-/// to keep log noise manageable. Set `FROG_DEBUG=1` for full output.
+/// 1. **Primitives** (0x01–0x10, 0x18–0x19): hardcoded lookup.
+/// 2. **VAR** (0x13) / **MVAR** (0x1E): read `Il2CppGenericParameter.index` from
+///    `data64` pointer → show `!0`, `!1`, … .  When `ctx` provides concrete type
+///    args, resolve to the instantiated type.
+/// 3. **SZARRAY** (0x1D): element type from `data64` pointer.
+/// 4. **ARRAY** (0x14): multi-dim array struct at `data64`.
+/// 5. **GENERICINST** (0x15): generic class definition + type args from
+///    `Il2CppGenericClass` / `Il2CppGenericInst`.
+/// 6. **CLASS** (0x12) / **VALUETYPE** (0x11): string-heap → FFI fallback.
+/// 7. **Object** (0x1C): hardcoded `System.Object`.
+/// 8. **Unknown** → `<type:{tc}>`.
 pub fn il2cpp_type_name(
     map: &RegionMap,
     type_ptr: usize,
     type_maps: &TypeMaps,
     cfg: &Il2CppConfig,
     api: &Il2CppApi,
+    ctx: Option<&GenericCtx>,
 ) -> String {
-    il2cpp_type_name_depth(map, type_ptr, type_maps, cfg, api, 0)
+    il2cpp_type_name_depth(map, type_ptr, type_maps, cfg, api, ctx, 0)
+}
+
+fn resolve_var_param(
+    map: &RegionMap,
+    param_ptr: usize,
+    ctx: Option<&GenericCtx>,
+    type_maps: &TypeMaps,
+    cfg: &Il2CppConfig,
+    api: &Il2CppApi,
+    depth: u8,
+) -> String {
+    // Index location varies per obfuscation:
+    //   Standard layout: u32 at +0x00 is GenericParameterIndex.
+    //   Obfuscated layout: index lives in the upper u16 of the word
+    //   at +0x08 (i.e. u16 at +0x0A).  Try both.
+    let idx = {
+        let direct = map.read_u32(param_ptr).unwrap_or(u32::MAX);
+        if direct <= 65535 {
+            direct
+        } else if let Some(hi) = map.read_u16(param_ptr.wrapping_add(10)) {
+            hi as u32
+        } else {
+            return "!?".into();
+        }
+    };
+    if let Some(ctx) = ctx {
+        if let Some(&arg_tp) = ctx.args.get(idx as usize) {
+            let concrete = il2cpp_type_name_depth(
+                map, arg_tp, type_maps, cfg, api, Some(ctx), depth + 1,
+            );
+            if !concrete.is_empty() && concrete != "?" {
+                return concrete;
+            }
+        }
+    }
+    format!("!{}", idx)
 }
 
 fn il2cpp_type_name_depth(
@@ -183,6 +230,7 @@ fn il2cpp_type_name_depth(
     type_maps: &TypeMaps,
     cfg: &Il2CppConfig,
     api: &Il2CppApi,
+    ctx: Option<&GenericCtx>,
     depth: u8,
 ) -> String {
     if depth > 8 {
@@ -211,12 +259,9 @@ fn il2cpp_type_name_depth(
         0x0E => return "System.String".into(),
         0x0F | 0x18 => return "System.IntPtr".into(),
         0x10 | 0x19 => return "System.UIntPtr".into(),
-        0x13 => {
-            // VAR — generic type parameter. `data64` is a metadata handle (a
-            // pointer into the generic-parameter table), NOT a small index, so the
-            // old `data64 as u16` printed garbage (proven strikes 1-2). Until we
-            // resolve the real param name/index via the metadata root, be honest.
-            return "!?".into();
+        0x13 | 0x1E => {
+            // VAR (0x13) / MVAR (0x1E) — generic/method type parameter.
+            return resolve_var_param(map, data64 as usize, ctx, type_maps, cfg, api, depth);
         }
         0x14 => {
             let arr_struct = data64 as usize;
@@ -229,6 +274,7 @@ fn il2cpp_type_name_depth(
                             type_maps,
                             cfg,
                             api,
+                            ctx,
                             depth + 1,
                         );
                         return format!("{}[]", elem_name);
@@ -237,12 +283,23 @@ fn il2cpp_type_name_depth(
             }
             return "System.Array".into();
         }
+        0x1D => {
+            // SZARRAY — single-dim zero-based array. data64 points to element type.
+            let elem_tp = data64 as usize;
+            if elem_tp != 0 {
+                let elem_name = il2cpp_type_name_depth(
+                    map, elem_tp, type_maps, cfg, api, ctx, depth + 1,
+                );
+                return format!("{}[]", elem_name);
+            }
+            return "System.Array".into();
+        }
         0x15 => {
             let gc = data64 as usize;
             // Generic definition: gc+0x0 = Il2CppType* of the open generic type.
             let def = map
                 .read_u64(gc)
-                .map(|tp| il2cpp_type_name_depth(map, tp as usize, type_maps, cfg, api, depth + 1))
+                .map(|tp| il2cpp_type_name_depth(map, tp as usize, type_maps, cfg, api, ctx, depth + 1))
                 .unwrap_or_default();
             if def.is_empty() || def == "?" {
                 return "System.Generic".into();
@@ -256,7 +313,7 @@ fn il2cpp_type_name_depth(
             for i in 0..argc.min(16) {
                 if let Some(arg_tp) = map.read_u64(argv + i * 8) {
                     args.push(il2cpp_type_name_depth(
-                        map, arg_tp as usize, type_maps, cfg, api, depth + 1,
+                        map, arg_tp as usize, type_maps, cfg, api, ctx, depth + 1,
                     ));
                 }
             }
@@ -288,7 +345,6 @@ fn il2cpp_type_name_depth(
             };
         }
         0x1C => return "System.Object".into(),
-        0x1D => return "System.Array".into(),
         _ => {}
     }
     format!("<type:{}>", tc)
