@@ -3,13 +3,12 @@
 //! The runtime never stores type names in plain text on the type itself; you
 //! have to walk through one of:
 //!   * the primitives table (compiled in below),
-//!   * the type-def map built from the class table at startup,
+//!   * the string-heap-base derived from the class table (primary path),
 //!   * `class_get_name` via FFI as a last resort, or
 //!   * the generic context (type args from `Il2CppGenericInst`) to resolve
 //!     VAR/MVAR generic parameters to their instantiated types.
 //!
-//! This module owns the name-resolution chain and the per-class lookup tables
-//! that feed it. Everything is read-only and bounds-checked through `RegionMap`.
+//! Everything is read-only and bounds-checked through `RegionMap`.
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
@@ -30,19 +29,7 @@ pub struct GenericCtx {
     pub args: Vec<usize>,
 }
 
-/// Two lookup strategies:
-/// - `td_map`: keyed by `klass + klass_type_def` value (packed typeDefIndex + flags)
-/// - `klass_map`: keyed by klass address (direct pointer)
-/// The klass_map is a fallback for when the td_map key doesn't match (packed flags differ).
 pub struct TypeMaps {
-    // Still built each run and retained as a secondary lookup surface, but the
-    // string-heap-base path is now the primary CLASS/VALUETYPE resolver, so these
-    // two maps have no in-crate reader at the moment. Kept (not removed) per design;
-    // allow(dead_code) avoids a spurious warning without dropping the data.
-    #[allow(dead_code)]
-    pub td_map: HashMap<usize, (usize, String, String)>,
-    #[allow(dead_code)]
-    pub klass_map: HashMap<usize, (String, String)>,
     pub string_heap_base: Option<usize>,
 }
 
@@ -53,8 +40,6 @@ pub fn build_type_maps(
     map: &RegionMap,
     cfg: &Il2CppConfig,
 ) -> TypeMaps {
-    let mut td_map: HashMap<usize, (usize, String, String)> = HashMap::new();
-    let mut klass_map: HashMap<usize, (String, String)> = HashMap::new();
     let mut base_votes: HashMap<usize, usize> = HashMap::new();
     let max = table_count.min(Tunables::load().table_max_slots);
     let mut c_slot = 0usize;
@@ -82,28 +67,21 @@ pub fn build_type_maps(
                         continue;
                     }
                     let td = td as usize;
-                    let cn = unsafe { cstr_to_string((api.class_get_name)(k as *mut c_void)) };
-                    if cn.is_empty() {
+                    // Guard: skip zero/garbage slots that have no readable name.
+                    if unsafe { cstr_to_string((api.class_get_name)(k as *mut c_void)) }.is_empty() {
                         continue;
                     }
-                    let ns = unsafe { cstr_to_string((api.class_get_namespace)(k as *mut c_void)) };
                     // Derive string_heap_base = name_ptr - nameIndex and vote.
-                    // name ptr is at klass+0x10 (il2cpp class name offset, stable); td is
+                    // name ptr is at klass+0x10 (stable il2cpp class name offset); td is
                     // byval_arg.data (a typedef ptr); nameIndex is the typedef's first u32.
-                    // base = name_ptr - nameIndex; the consensus across classes is the
-                    // real per-launch runtime base.
+                    // Consensus across classes gives the real per-launch runtime base.
                     if let (Some(np), Some(name_idx)) = (map.read_u64(k + 0x10), map.read_u32(td)) {
                         let np = np as usize;
                         let name_idx = name_idx as usize;
                         if np > name_idx {
-                            let cand = np - name_idx;
-                            *base_votes.entry(cand).or_insert(0) += 1;
+                            *base_votes.entry(np - name_idx).or_insert(0) += 1;
                         }
                     }
-                    if !td_map.contains_key(&td) {
-                        td_map.insert(td, (k, cn.clone(), ns.clone()));
-                    }
-                    klass_map.insert(k, (cn, ns));
                 }
                 None => {
                     c_td_fail += 1;
@@ -112,14 +90,8 @@ pub fn build_type_maps(
         }
     }
     log(&format!(
-        "  type maps: td={} klass={} (slots={}, ptrs={}, ns_ok={}, td_ok={}, td_fail={})",
-        td_map.len(),
-        klass_map.len(),
-        c_slot,
-        c_nonzero,
-        c_ns_ok,
-        c_td_ok,
-        c_td_fail
+        "  class table: slots={}, ptrs={}, ns_ok={}, td_ok={}, td_fail={}",
+        c_slot, c_nonzero, c_ns_ok, c_td_ok, c_td_fail
     ));
     let string_heap_base = base_votes
         .iter()
@@ -131,7 +103,7 @@ pub fn build_type_maps(
         string_heap_base.map(|b| format!("{:#x}", b)),
         base_votes.len()
     ));
-    TypeMaps { td_map, klass_map, string_heap_base }
+    TypeMaps { string_heap_base }
 }
 
 /// Resolve a type name from a typedef pointer using the derived string-heap base.
