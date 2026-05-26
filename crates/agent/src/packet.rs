@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -30,8 +31,47 @@ type WSARecvFn = unsafe extern "system" fn(
 static SEND_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 static RECV_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 static WSARECV_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
-static PACKET_LOG: Mutex<Vec<PacketEntry>> = Mutex::new(Vec::new());
+#[derive(Debug, Clone, Copy)]
+pub struct SafeWSABUF {
+    pub len: u32,
+    pub buf: usize,
+}
+
+static GQCS_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static GQCSEX_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static PACKET_LOG: Mutex<Vec<RawPacketFrame>> = Mutex::new(Vec::new());
 static PACKET_SENDER: OnceLock<Sender<String>> = OnceLock::new();
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OVERLAPPED_ENTRY {
+    pub lp_completion_key: usize,
+    pub lp_overlapped: *mut std::ffi::c_void,
+    pub internal: usize,
+    pub dw_number_of_bytes_transferred: u32,
+}
+
+type GQCSFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HANDLE,
+    *mut u32,
+    *mut usize,
+    *mut *mut std::ffi::c_void,
+    u32,
+) -> windows_sys::Win32::Foundation::BOOL;
+
+type GQCSExFn = unsafe extern "system" fn(
+    windows_sys::Win32::Foundation::HANDLE,
+    *mut OVERLAPPED_ENTRY,
+    u32,
+    *mut u32,
+    u32,
+    windows_sys::Win32::Foundation::BOOL,
+) -> windows_sys::Win32::Foundation::BOOL;
+
+fn get_pending_recv() -> &'static Mutex<HashMap<usize, Vec<SafeWSABUF>>> {
+    static MAP: OnceLock<Mutex<HashMap<usize, Vec<SafeWSABUF>>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 thread_local! {
     static IN_HOOK: Cell<bool> = Cell::new(false);
@@ -44,18 +84,16 @@ pub enum Direction {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct PacketEntry {
+pub struct RawPacketFrame {
     pub timestamp_ms: u64,
     pub direction: Direction,
     pub raw_len: usize,
-    pub bson_json: Option<String>,
-    pub raw_preview: String,
+    pub payload_hex: String,
 }
 
 fn hex_preview(buf: &[u8]) -> String {
-    let limit = std::cmp::min(buf.len(), 64);
-    let mut s = String::with_capacity(limit * 2);
-    for &b in &buf[..limit] {
+    let mut s = String::with_capacity(buf.len() * 2);
+    for &b in buf {
         s.push_str(&format!("{:02x}", b));
     }
     s
@@ -66,203 +104,15 @@ fn get_timestamp() -> u64 {
     START_TIME.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
-use std::time::{Duration, Instant};
-
-#[derive(serde::Deserialize, serde::Serialize, Clone)]
-struct PacketConfig {
-    filters: Vec<String>,
-    mappings: HashMap<String, String>,
-}
-
-static CONFIG: Mutex<Option<(PacketConfig, Instant)>> = Mutex::new(None);
-
-fn get_config() -> PacketConfig {
-    let mut guard = CONFIG.lock().unwrap();
-    let now = Instant::now();
-    
-    if let Some((ref cfg, last_loaded)) = *guard {
-        if now.duration_since(last_loaded) < Duration::from_secs(2) {
-            return cfg.clone();
-        }
-    }
-
-    let path = crate::paths::output_path("packet_config.json");
-    let mut loaded_cfg = None;
-
-    if path.exists() {
-        if let Ok(mut file) = File::open(&path) {
-            let mut data = String::new();
-            if file.read_to_string(&mut data).is_ok() {
-                if let Ok(cfg) = serde_json::from_str::<PacketConfig>(&data) {
-                    loaded_cfg = Some(cfg);
-                }
-            }
-        }
-    }
-
-    let cfg = match loaded_cfg {
-        Some(c) => c,
-        None => {
-            let default_cfg = PacketConfig {
-                filters: vec![
-                    "ldEM".to_string(),
-                    "Islh".to_string(),
-                    "vHPe".to_string(),
-                ],
-                mappings: [
-                    ("ldEM", "Heartbeat"),
-                    ("GnkD", "Move"),
-                    ("VChk", "VersionCheck"),
-                    ("RuXN", "Login"),
-                    ("ppIX", "JoinWorld"),
-                    ("rICq", "WorldLoad"),
-                    ("Islh", "Idle"),
-                    ("UtgH", "Navigate"),
-                    ("sMMF", "PlaceBlock"),
-                    ("dIIB", "SelectItem"),
-                    ("mSjb", "CollectItem"),
-                    ("zCXI", "PlayAudio"),
-                    ("TiLT", "TapTile"),
-                    ("RlLO", "MenuAction"),
-                    ("PZlO", "UIAction"),
-                    ("yGLu", "WorldState"),
-                    ("eIgm", "StopMoving"),
-                    ("tmqV", "Settings"),
-                    ("vHPe", "Ping"),
-                    ("DZJs", "DataRequest"),
-                    ("uygc", "Refresh"),
-                    ("YWtw", "Sync"),
-                    ("xxMa", "Config"),
-                    ("Rlsm", "SetValue"),
-                    ("yOLm", "Query"),
-                    ("sDPK", "Status"),
-                    ("uqjs", "Ready"),
-                    ("empB", "MenuOpen"),
-                    ("Fwpn", "FetchData"),
-                    ("JlfF", "Disconnect"),
-                    ("fgkp", "Cleanup"),
-                ]
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-            };
-            if let Ok(json_str) = serde_json::to_string_pretty(&default_cfg) {
-                let _ = std::fs::write(&path, json_str);
-            }
-            default_cfg
-        }
-    };
-
-    *guard = Some((cfg.clone(), now));
-    cfg
-}
-
-fn format_activity_line(entry: &PacketEntry) -> String {
+fn format_activity_line(entry: &RawPacketFrame) -> String {
     let direction_tag = match entry.direction {
         Direction::C2S => "[OUTGOING]",
         Direction::S2C => "[INCOMING]",
     };
-
-    let mut label = "???".to_string();
-    let mut pretty_json = String::new();
-    let config = get_config();
-
-    if let Some(ref bson_str) = entry.bson_json {
-        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(bson_str) {
-            // Build pretty json
-            if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
-                // Indent pretty json
-                pretty_json = pretty.lines().map(|line| format!("  {}", line)).collect::<Vec<_>>().join("\n");
-            }
-
-            // Extract labels
-            if let Some(obj) = json_val.as_object() {
-                let mut keys: Vec<&String> = obj.keys().collect();
-                keys.sort();
-                let mut labels = Vec::new();
-                for key in keys {
-                    if let Some(val_obj) = obj.get(key).and_then(|v| v.as_object()) {
-                        if let Some(id_val) = val_obj.get("ID").and_then(|id| id.as_str()) {
-                            let name = match config.mappings.get(id_val) {
-                                Some(name_str) => name_str.as_str(),
-                                None => id_val,
-                            };
-                            labels.push(name);
-                        }
-                    }
-                }
-                if !labels.is_empty() {
-                    label = labels.join(" + ");
-                }
-            }
-        }
-    }
-
-    if entry.bson_json.is_some() {
-        format!("{} {} ({} bytes)\n{}\n\n", direction_tag, label, entry.raw_len, pretty_json)
-    } else {
-        if entry.raw_len <= 1 {
-            String::new()
-        } else {
-            format!("{} [RAW {} bytes] {}\n\n", direction_tag, entry.raw_len, entry.raw_preview)
-        }
-    }
+    format!("{} {} bytes: {}\n\n", direction_tag, entry.raw_len, entry.payload_hex)
 }
 
-fn should_filter_packet(_len: usize, bson_json: &Option<String>) -> bool {
-    // 1. If it's not a parsed BSON document, it's just raw TCP/TLS overhead, filter it out.
-    let bson_str = match bson_json {
-        Some(s) => s,
-        None => return true,
-    };
-
-    let config = get_config();
-
-    // 2. Parse the BSON JSON value
-    if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(bson_str) {
-        if let Some(obj) = json_val.as_object() {
-            let mut has_gameplay_events = false;
-            let mut has_other_keys = false;
-
-            for (key, val) in obj {
-                let is_msg_key = key.starts_with('m') && key[1..].chars().all(|c| c.is_ascii_digit());
-                if is_msg_key {
-                    if let Some(val_obj) = val.as_object() {
-                        if let Some(id_str) = val_obj.get("ID").and_then(|id| id.as_str()) {
-                            if config.filters.iter().any(|f| f == id_str) {
-                                // It is one of the filtered IDs
-                            } else {
-                                has_gameplay_events = true;
-                            }
-                        } else {
-                            has_other_keys = true;
-                        }
-                    } else {
-                        has_other_keys = true;
-                    }
-                } else if key != "sGot" {
-                    has_other_keys = true;
-                }
-            }
-
-            // Filter out if it contains only background noise IDs or ACK fields
-            if !has_gameplay_events && !has_other_keys {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn log_packet_entry(entry: PacketEntry) {
-    if should_filter_packet(entry.raw_len, &entry.bson_json) {
-        return;
-    }
-
+fn log_packet_entry(entry: RawPacketFrame) {
     let json_line = match serde_json::to_string(&entry) {
         Ok(line) => line,
         Err(_) => return,
@@ -312,14 +162,12 @@ unsafe extern "system" fn send_detour(s: usize, buf: *const u8, len: i32, flags:
     if len > 0 && !buf.is_null() {
         let data = std::slice::from_raw_parts(buf, len as usize);
         let preview = hex_preview(data);
-        let bson_json = crate::bson::try_parse_bson(data);
 
-        let entry = PacketEntry {
+        let entry = RawPacketFrame {
             timestamp_ms: get_timestamp(),
             direction: Direction::C2S,
             raw_len: len as usize,
-            bson_json,
-            raw_preview: preview,
+            payload_hex: preview,
         };
 
         log_packet_entry(entry);
@@ -335,6 +183,14 @@ unsafe extern "system" fn send_detour(s: usize, buf: *const u8, len: i32, flags:
     }
     let orig: SendFn = std::mem::transmute(tramp);
     let bytes_sent = orig(s, buf, len, flags);
+
+    let err = if bytes_sent == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    if bytes_sent > 0 || (bytes_sent == -1 && err != windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK as i32) {
+        crate::paths::log(&format!(
+            "[send detour] s={}, len={}, bytes_sent={}, err={}",
+            s, len, bytes_sent, err
+        ));
+    }
 
     IN_HOOK.with(|h| h.set(false));
     bytes_sent
@@ -366,17 +222,23 @@ unsafe extern "system" fn recv_detour(s: usize, buf: *mut u8, len: i32, flags: i
     let orig: RecvFn = std::mem::transmute(tramp);
     let bytes_received = orig(s, buf, len, flags);
 
+    let err = if bytes_received == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    if bytes_received > 0 || (bytes_received == -1 && err != windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK as i32) {
+        crate::paths::log(&format!(
+            "[recv detour] s={}, len={}, bytes_received={}, err={}",
+            s, len, bytes_received, err
+        ));
+    }
+
     if bytes_received > 0 {
         let data = std::slice::from_raw_parts(buf, bytes_received as usize);
         let preview = hex_preview(data);
-        let bson_json = crate::bson::try_parse_bson(data);
 
-        let entry = PacketEntry {
+        let entry = RawPacketFrame {
             timestamp_ms: get_timestamp(),
             direction: Direction::S2C,
             raw_len: bytes_received as usize,
-            bson_json,
-            raw_preview: preview,
+            payload_hex: preview,
         };
 
         log_packet_entry(entry);
@@ -420,6 +282,13 @@ unsafe extern "system" fn wsarecv_detour(
     let orig: WSARecvFn = std::mem::transmute(tramp);
     let res = orig(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
 
+    let err = if res == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    let recvd_val = if !lpNumberOfBytesRecvd.is_null() { unsafe { *lpNumberOfBytesRecvd } } else { 999999 };
+    crate::paths::log(&format!(
+        "[WSARecv detour] s={}, dwBufferCount={}, lpNumberOfBytesRecvd_ptr={:?}, val={}, lpOverlapped={:?} -> res={}, err={}",
+        s, dwBufferCount, lpNumberOfBytesRecvd, recvd_val, lpOverlapped, res, err
+    ));
+
     if res == 0 {
         let bytes_received = if !lpNumberOfBytesRecvd.is_null() {
             *lpNumberOfBytesRecvd as usize
@@ -428,41 +297,156 @@ unsafe extern "system" fn wsarecv_detour(
         };
 
         if bytes_received > 0 && !lpBuffers.is_null() && dwBufferCount > 0 {
-            let mut gathered = Vec::with_capacity(bytes_received);
-            let mut remaining = bytes_received;
+            let mut bufs = Vec::with_capacity(dwBufferCount as usize);
             for i in 0..dwBufferCount {
-                if remaining == 0 {
-                    break;
-                }
-                let buf_ptr = lpBuffers.add(i as usize);
-                let buf_len = (*buf_ptr).len as usize;
-                let buf_data = (*buf_ptr).buf;
-                if !buf_data.is_null() && buf_len > 0 {
-                    let to_copy = std::cmp::min(remaining, buf_len);
-                    let slice = std::slice::from_raw_parts(buf_data, to_copy);
-                    gathered.extend_from_slice(slice);
-                    remaining -= to_copy;
-                }
+                let raw_buf = *lpBuffers.add(i as usize);
+                bufs.push(SafeWSABUF {
+                    len: raw_buf.len,
+                    buf: raw_buf.buf as usize,
+                });
             }
-
-            if !gathered.is_empty() {
-                let preview = hex_preview(&gathered);
-                let bson_json = crate::bson::try_parse_bson(&gathered);
-
-                let entry = PacketEntry {
-                    timestamp_ms: get_timestamp(),
-                    direction: Direction::S2C,
-                    raw_len: gathered.len(),
-                    bson_json,
-                    raw_preview: preview,
-                };
-
-                log_packet_entry(entry);
+            handle_async_completed_data(&bufs, bytes_received);
+        }
+    } else if res == -1 {
+        if err == windows_sys::Win32::Networking::WinSock::WSA_IO_PENDING as i32 && !lpOverlapped.is_null() && !lpBuffers.is_null() && dwBufferCount > 0 {
+            let mut bufs = Vec::with_capacity(dwBufferCount as usize);
+            for i in 0..dwBufferCount {
+                let raw_buf = *lpBuffers.add(i as usize);
+                bufs.push(SafeWSABUF {
+                    len: raw_buf.len,
+                    buf: raw_buf.buf as usize,
+                });
             }
+            get_pending_recv().lock().unwrap().insert(lpOverlapped as usize, bufs);
         }
     }
 
     IN_HOOK.with(|h| h.set(false));
+    res
+}
+
+fn handle_async_completed_data(bufs: &[SafeWSABUF], bytes_received: usize) {
+    let mut gathered = Vec::with_capacity(bytes_received);
+    let mut remaining = bytes_received;
+    for buf in bufs {
+        if remaining == 0 {
+            break;
+        }
+        let buf_len = buf.len as usize;
+        let buf_data = buf.buf as *mut u8;
+        if !buf_data.is_null() && buf_len > 0 {
+            let to_copy = std::cmp::min(remaining, buf_len);
+            let slice = unsafe { std::slice::from_raw_parts(buf_data, to_copy) };
+            gathered.extend_from_slice(slice);
+            remaining -= to_copy;
+        }
+    }
+
+    if !gathered.is_empty() {
+        let preview = hex_preview(&gathered);
+
+        let entry = RawPacketFrame {
+            timestamp_ms: get_timestamp(),
+            direction: Direction::S2C,
+            raw_len: gathered.len(),
+            payload_hex: preview,
+        };
+
+        log_packet_entry(entry);
+    }
+}
+
+unsafe extern "system" fn gqcs_detour(
+    completion_port: windows_sys::Win32::Foundation::HANDLE,
+    lp_number_of_bytes_transferred: *mut u32,
+    lp_completion_key: *mut usize,
+    lp_overlapped: *mut *mut std::ffi::c_void,
+    dw_milliseconds: u32,
+) -> windows_sys::Win32::Foundation::BOOL {
+    let tramp = {
+        let guard = GQCS_HOOK.lock().unwrap();
+        guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+    };
+    if tramp == 0 {
+        return 0;
+    }
+    let orig: GQCSFn = std::mem::transmute(tramp);
+    let res = orig(completion_port, lp_number_of_bytes_transferred, lp_completion_key, lp_overlapped, dw_milliseconds);
+
+    if res != 0 && !lp_overlapped.is_null() && !(*lp_overlapped).is_null() {
+        let overlapped_addr = *lp_overlapped as usize;
+        let bytes_transferred = if !lp_number_of_bytes_transferred.is_null() {
+            *lp_number_of_bytes_transferred as usize
+        } else {
+            0
+        };
+
+        let has_pending = get_pending_recv().lock().unwrap().contains_key(&overlapped_addr);
+        if bytes_transferred > 0 || has_pending {
+            crate::paths::log(&format!(
+                "[gqcs detour] overlapped_addr={:#x}, bytes_transferred={}, has_pending={}",
+                overlapped_addr, bytes_transferred, has_pending
+            ));
+        }
+
+        if bytes_transferred > 0 {
+            let pending = get_pending_recv().lock().unwrap().remove(&overlapped_addr);
+            if let Some(bufs) = pending {
+                handle_async_completed_data(&bufs, bytes_transferred);
+            }
+        } else {
+            get_pending_recv().lock().unwrap().remove(&overlapped_addr);
+        }
+    }
+
+    res
+}
+
+unsafe extern "system" fn gqcsex_detour(
+    completion_port: windows_sys::Win32::Foundation::HANDLE,
+    lp_completion_port_entries: *mut OVERLAPPED_ENTRY,
+    ul_count: u32,
+    ul_num_entries_removed: *mut u32,
+    dw_milliseconds: u32,
+    f_alertable: windows_sys::Win32::Foundation::BOOL,
+) -> windows_sys::Win32::Foundation::BOOL {
+    let tramp = {
+        let guard = GQCSEX_HOOK.lock().unwrap();
+        guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+    };
+    if tramp == 0 {
+        return 0;
+    }
+    let orig: GQCSExFn = std::mem::transmute(tramp);
+    let res = orig(completion_port, lp_completion_port_entries, ul_count, ul_num_entries_removed, dw_milliseconds, f_alertable);
+
+    if res != 0 && !lp_completion_port_entries.is_null() && !ul_num_entries_removed.is_null() {
+        let removed = *ul_num_entries_removed as usize;
+        let mut pending_guard = get_pending_recv().lock().unwrap();
+        for i in 0..removed {
+            let entry = lp_completion_port_entries.add(i);
+            let overlapped_addr = (*entry).lp_overlapped as usize;
+            if overlapped_addr != 0 {
+                let bytes_transferred = (*entry).dw_number_of_bytes_transferred as usize;
+                let has_pending = pending_guard.contains_key(&overlapped_addr);
+                if bytes_transferred > 0 || has_pending {
+                    crate::paths::log(&format!(
+                        "[gqcsex detour] entry={} overlapped_addr={:#x}, bytes_transferred={}, has_pending={}",
+                        i, overlapped_addr, bytes_transferred, has_pending
+                    ));
+                }
+
+                if bytes_transferred > 0 {
+                    if let Some(bufs) = pending_guard.remove(&overlapped_addr) {
+                        handle_async_completed_data(&bufs, bytes_transferred);
+                    }
+                } else {
+                    pending_guard.remove(&overlapped_addr);
+                }
+            }
+        }
+    }
+
     res
 }
 
@@ -567,6 +551,28 @@ pub unsafe fn install_packet_hooks() {
     } else {
         crate::paths::log("Failed to resolve WSARecv in ws2_32.dll");
     }
+
+    let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
+    if !kernel32.is_null() {
+        let gqcs_addr = GetProcAddress(kernel32, b"GetQueuedCompletionStatus\0".as_ptr());
+        let gqcsex_addr = GetProcAddress(kernel32, b"GetQueuedCompletionStatusEx\0".as_ptr());
+
+        if let Some(gqcs_addr) = gqcs_addr {
+            let hook = crate::hook::install(gqcs_addr as usize, gqcs_detour as *const () as usize);
+            if let Some(hook) = hook {
+                *GQCS_HOOK.lock().unwrap() = Some(hook);
+                crate::paths::log("GetQueuedCompletionStatus hooked successfully");
+            }
+        }
+
+        if let Some(gqcsex_addr) = gqcsex_addr {
+            let hook = crate::hook::install(gqcsex_addr as usize, gqcsex_detour as *const () as usize);
+            if let Some(hook) = hook {
+                *GQCSEX_HOOK.lock().unwrap() = Some(hook);
+                crate::paths::log("GetQueuedCompletionStatusEx hooked successfully");
+            }
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -583,10 +589,18 @@ pub unsafe fn remove_packet_hooks() {
         hook.remove();
         crate::paths::log("Winsock WSARecv unhooked");
     }
+    if let Some(mut hook) = GQCS_HOOK.lock().unwrap().take() {
+        hook.remove();
+        crate::paths::log("GetQueuedCompletionStatus unhooked");
+    }
+    if let Some(mut hook) = GQCSEX_HOOK.lock().unwrap().take() {
+        hook.remove();
+        crate::paths::log("GetQueuedCompletionStatusEx unhooked");
+    }
 }
 
 #[allow(dead_code)]
-pub fn take_packets() -> Vec<PacketEntry> {
+pub fn take_packets() -> Vec<RawPacketFrame> {
     if let Ok(mut log) = PACKET_LOG.lock() {
         std::mem::take(&mut *log)
     } else {
