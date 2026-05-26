@@ -9,6 +9,34 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress
 use crate::hook::Hook;
 
 type SendFn = unsafe extern "system" fn(usize, *const u8, i32, i32) -> i32;
+type WSASendFn = unsafe extern "system" fn(
+    usize,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    u32,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+) -> i32;
+type SendToFn = unsafe extern "system" fn(
+    usize,
+    *const u8,
+    i32,
+    i32,
+    *const std::ffi::c_void,
+    i32,
+) -> i32;
+type WSASendToFn = unsafe extern "system" fn(
+    usize,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    u32,
+    *const std::ffi::c_void,
+    i32,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+) -> i32;
 type RecvFn = unsafe extern "system" fn(usize, *mut u8, i32, i32) -> i32;
 
 #[repr(C)]
@@ -27,10 +55,35 @@ type WSARecvFn = unsafe extern "system" fn(
     *mut std::ffi::c_void,
     *mut std::ffi::c_void,
 ) -> i32;
+type RecvFromFn = unsafe extern "system" fn(
+    usize,
+    *mut u8,
+    i32,
+    i32,
+    *mut std::ffi::c_void,
+    *mut i32,
+) -> i32;
+type WSARecvFromFn = unsafe extern "system" fn(
+    usize,
+    *mut WSABUF,
+    u32,
+    *mut u32,
+    *mut u32,
+    *mut std::ffi::c_void,
+    *mut i32,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+) -> i32;
 
 static SEND_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static WSASEND_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static SENDTO_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static WSASENDTO_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 static RECV_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
 static WSARECV_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static RECVFROM_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+static WSARECVFROM_HOOK: Mutex<Option<Hook>> = Mutex::new(None);
+
 #[derive(Debug, Clone, Copy)]
 pub struct SafeWSABUF {
     pub len: u32,
@@ -325,6 +378,340 @@ unsafe extern "system" fn wsarecv_detour(
     res
 }
 
+unsafe extern "system" fn wsasend_detour(
+    s: usize,
+    lpBuffers: *const WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesSent: *mut u32,
+    dwFlags: u32,
+    lpOverlapped: *mut std::ffi::c_void,
+    lpCompletionRoutine: *mut std::ffi::c_void,
+) -> i32 {
+    if IN_HOOK.with(|h| h.get()) {
+        let tramp = {
+            let guard = WSASEND_HOOK.lock().unwrap();
+            guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+        };
+        if tramp != 0 {
+            let orig: WSASendFn = std::mem::transmute(tramp);
+            return orig(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpOverlapped, lpCompletionRoutine);
+        }
+        return -1;
+    }
+
+    IN_HOOK.with(|h| h.set(true));
+
+    if !lpBuffers.is_null() && dwBufferCount > 0 {
+        let mut gathered = Vec::new();
+        for i in 0..dwBufferCount {
+            let buf = *lpBuffers.add(i as usize);
+            if !buf.buf.is_null() && buf.len > 0 {
+                let slice = std::slice::from_raw_parts(buf.buf, buf.len as usize);
+                gathered.extend_from_slice(slice);
+            }
+        }
+        if !gathered.is_empty() {
+            let preview = hex_preview(&gathered);
+            let entry = RawPacketFrame {
+                timestamp_ms: get_timestamp(),
+                direction: Direction::C2S,
+                raw_len: gathered.len(),
+                payload_hex: preview,
+            };
+            log_packet_entry(entry);
+        }
+    }
+
+    let tramp = {
+        let guard = WSASEND_HOOK.lock().unwrap();
+        guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+    };
+    if tramp == 0 {
+        IN_HOOK.with(|h| h.set(false));
+        return -1;
+    }
+    let orig: WSASendFn = std::mem::transmute(tramp);
+    let res = orig(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpOverlapped, lpCompletionRoutine);
+
+    let err = if res == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    let sent_val = if !lpNumberOfBytesSent.is_null() { unsafe { *lpNumberOfBytesSent } } else { 999999 };
+    if res != 0 || err != windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK as i32 {
+        crate::paths::log(&format!(
+            "[WSASend detour] s={}, dwBufferCount={}, lpNumberOfBytesSent_val={}, res={}, err={}",
+            s, dwBufferCount, sent_val, res, err
+        ));
+    }
+
+    IN_HOOK.with(|h| h.set(false));
+    res
+}
+
+unsafe extern "system" fn sendto_detour(
+    s: usize,
+    buf: *const u8,
+    len: i32,
+    flags: i32,
+    to: *const std::ffi::c_void,
+    tolen: i32,
+) -> i32 {
+    if IN_HOOK.with(|h| h.get()) {
+        let tramp = {
+            let guard = SENDTO_HOOK.lock().unwrap();
+            guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+        };
+        if tramp != 0 {
+            let orig: SendToFn = std::mem::transmute(tramp);
+            return orig(s, buf, len, flags, to, tolen);
+        }
+        return -1;
+    }
+
+    IN_HOOK.with(|h| h.set(true));
+
+    if len > 0 && !buf.is_null() {
+        let data = std::slice::from_raw_parts(buf, len as usize);
+        let preview = hex_preview(data);
+        let entry = RawPacketFrame {
+            timestamp_ms: get_timestamp(),
+            direction: Direction::C2S,
+            raw_len: len as usize,
+            payload_hex: preview,
+        };
+        log_packet_entry(entry);
+    }
+
+    let tramp = {
+        let guard = SENDTO_HOOK.lock().unwrap();
+        guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+    };
+    if tramp == 0 {
+        IN_HOOK.with(|h| h.set(false));
+        return -1;
+    }
+    let orig: SendToFn = std::mem::transmute(tramp);
+    let bytes_sent = orig(s, buf, len, flags, to, tolen);
+
+    let err = if bytes_sent == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    if bytes_sent > 0 || (bytes_sent == -1 && err != windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK as i32) {
+        crate::paths::log(&format!(
+            "[sendto detour] s={}, len={}, bytes_sent={}, err={}",
+            s, len, bytes_sent, err
+        ));
+    }
+
+    IN_HOOK.with(|h| h.set(false));
+    bytes_sent
+}
+
+unsafe extern "system" fn wsasendto_detour(
+    s: usize,
+    lpBuffers: *const WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesSent: *mut u32,
+    dwFlags: u32,
+    lpTo: *const std::ffi::c_void,
+    iTolen: i32,
+    lpOverlapped: *mut std::ffi::c_void,
+    lpCompletionRoutine: *mut std::ffi::c_void,
+) -> i32 {
+    if IN_HOOK.with(|h| h.get()) {
+        let tramp = {
+            let guard = WSASENDTO_HOOK.lock().unwrap();
+            guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+        };
+        if tramp != 0 {
+            let orig: WSASendToFn = std::mem::transmute(tramp);
+            return orig(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
+        }
+        return -1;
+    }
+
+    IN_HOOK.with(|h| h.set(true));
+
+    if !lpBuffers.is_null() && dwBufferCount > 0 {
+        let mut gathered = Vec::new();
+        for i in 0..dwBufferCount {
+            let buf = *lpBuffers.add(i as usize);
+            if !buf.buf.is_null() && buf.len > 0 {
+                let slice = std::slice::from_raw_parts(buf.buf, buf.len as usize);
+                gathered.extend_from_slice(slice);
+            }
+        }
+        if !gathered.is_empty() {
+            let preview = hex_preview(&gathered);
+            let entry = RawPacketFrame {
+                timestamp_ms: get_timestamp(),
+                direction: Direction::C2S,
+                raw_len: gathered.len(),
+                payload_hex: preview,
+            };
+            log_packet_entry(entry);
+        }
+    }
+
+    let tramp = {
+        let guard = WSASENDTO_HOOK.lock().unwrap();
+        guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+    };
+    if tramp == 0 {
+        IN_HOOK.with(|h| h.set(false));
+        return -1;
+    }
+    let orig: WSASendToFn = std::mem::transmute(tramp);
+    let res = orig(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iTolen, lpOverlapped, lpCompletionRoutine);
+
+    let err = if res == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    let sent_val = if !lpNumberOfBytesSent.is_null() { unsafe { *lpNumberOfBytesSent } } else { 999999 };
+    if res != 0 || err != windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK as i32 {
+        crate::paths::log(&format!(
+            "[WSASendTo detour] s={}, dwBufferCount={}, lpNumberOfBytesSent_val={}, res={}, err={}",
+            s, dwBufferCount, sent_val, res, err
+        ));
+    }
+
+    IN_HOOK.with(|h| h.set(false));
+    res
+}
+
+unsafe extern "system" fn recvfrom_detour(
+    s: usize,
+    buf: *mut u8,
+    len: i32,
+    flags: i32,
+    from: *mut std::ffi::c_void,
+    fromlen: *mut i32,
+) -> i32 {
+    if IN_HOOK.with(|h| h.get()) {
+        let tramp = {
+            let guard = RECVFROM_HOOK.lock().unwrap();
+            guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+        };
+        if tramp != 0 {
+            let orig: RecvFromFn = std::mem::transmute(tramp);
+            return orig(s, buf, len, flags, from, fromlen);
+        }
+        return -1;
+    }
+
+    IN_HOOK.with(|h| h.set(true));
+
+    let tramp = {
+        let guard = RECVFROM_HOOK.lock().unwrap();
+        guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+    };
+    if tramp == 0 {
+        IN_HOOK.with(|h| h.set(false));
+        return -1;
+    }
+    let orig: RecvFromFn = std::mem::transmute(tramp);
+    let bytes_received = orig(s, buf, len, flags, from, fromlen);
+
+    let err = if bytes_received == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    if bytes_received > 0 || (bytes_received == -1 && err != windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK as i32) {
+        crate::paths::log(&format!(
+            "[recvfrom detour] s={}, len={}, bytes_received={}, err={}",
+            s, len, bytes_received, err
+        ));
+    }
+
+    if bytes_received > 0 && !buf.is_null() {
+        let data = std::slice::from_raw_parts(buf, bytes_received as usize);
+        let preview = hex_preview(data);
+        let entry = RawPacketFrame {
+            timestamp_ms: get_timestamp(),
+            direction: Direction::S2C,
+            raw_len: bytes_received as usize,
+            payload_hex: preview,
+        };
+        log_packet_entry(entry);
+    }
+
+    IN_HOOK.with(|h| h.set(false));
+    bytes_received
+}
+
+unsafe extern "system" fn wsarecvfrom_detour(
+    s: usize,
+    lpBuffers: *mut WSABUF,
+    dwBufferCount: u32,
+    lpNumberOfBytesRecvd: *mut u32,
+    lpFlags: *mut u32,
+    lpFrom: *mut std::ffi::c_void,
+    lpFromlen: *mut i32,
+    lpOverlapped: *mut std::ffi::c_void,
+    lpCompletionRoutine: *mut std::ffi::c_void,
+) -> i32 {
+    if IN_HOOK.with(|h| h.get()) {
+        let tramp = {
+            let guard = WSARECVFROM_HOOK.lock().unwrap();
+            guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+        };
+        if tramp != 0 {
+            let orig: WSARecvFromFn = std::mem::transmute(tramp);
+            return orig(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpFrom, lpFromlen, lpOverlapped, lpCompletionRoutine);
+        }
+        return -1;
+    }
+
+    IN_HOOK.with(|h| h.set(true));
+
+    let tramp = {
+        let guard = WSARECVFROM_HOOK.lock().unwrap();
+        guard.as_ref().map(|h| h.trampoline).unwrap_or(0)
+    };
+    if tramp == 0 {
+        IN_HOOK.with(|h| h.set(false));
+        return -1;
+    }
+    let orig: WSARecvFromFn = std::mem::transmute(tramp);
+    let res = orig(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpFrom, lpFromlen, lpOverlapped, lpCompletionRoutine);
+
+    let err = if res == -1 { unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() } } else { 0 };
+    let recvd_val = if !lpNumberOfBytesRecvd.is_null() { unsafe { *lpNumberOfBytesRecvd } } else { 999999 };
+    
+    if res == 0 || (res == -1 && err != windows_sys::Win32::Networking::WinSock::WSAEWOULDBLOCK as i32) {
+        crate::paths::log(&format!(
+            "[WSARecvFrom detour] s={}, dwBufferCount={}, lpNumberOfBytesRecvd_val={}, res={}, err={}",
+            s, dwBufferCount, recvd_val, res, err
+        ));
+    }
+
+    if res == 0 {
+        let bytes_received = if !lpNumberOfBytesRecvd.is_null() {
+            *lpNumberOfBytesRecvd as usize
+        } else {
+            0
+        };
+
+        if bytes_received > 0 && !lpBuffers.is_null() && dwBufferCount > 0 {
+            let mut bufs = Vec::with_capacity(dwBufferCount as usize);
+            for i in 0..dwBufferCount {
+                let raw_buf = *lpBuffers.add(i as usize);
+                bufs.push(SafeWSABUF {
+                    len: raw_buf.len,
+                    buf: raw_buf.buf as usize,
+                });
+            }
+            handle_async_completed_data(&bufs, bytes_received);
+        }
+    } else if res == -1 {
+        if err == windows_sys::Win32::Networking::WinSock::WSA_IO_PENDING as i32 && !lpOverlapped.is_null() && !lpBuffers.is_null() && dwBufferCount > 0 {
+            let mut bufs = Vec::with_capacity(dwBufferCount as usize);
+            for i in 0..dwBufferCount {
+                let raw_buf = *lpBuffers.add(i as usize);
+                bufs.push(SafeWSABUF {
+                    len: raw_buf.len,
+                    buf: raw_buf.buf as usize,
+                });
+            }
+            get_pending_recv().lock().unwrap().insert(lpOverlapped as usize, bufs);
+        }
+    }
+
+    IN_HOOK.with(|h| h.set(false));
+    res
+}
+
 fn handle_async_completed_data(bufs: &[SafeWSABUF], bytes_received: usize) {
     let mut gathered = Vec::with_capacity(bytes_received);
     let mut remaining = bytes_received;
@@ -519,8 +906,14 @@ pub unsafe fn install_packet_hooks() {
     }
 
     let send_addr = GetProcAddress(ws2, b"send\0".as_ptr());
+    let wsasend_addr = GetProcAddress(ws2, b"WSASend\0".as_ptr());
+    let sendto_addr = GetProcAddress(ws2, b"sendto\0".as_ptr());
+    let wsasendto_addr = GetProcAddress(ws2, b"WSASendTo\0".as_ptr());
+
     let recv_addr = GetProcAddress(ws2, b"recv\0".as_ptr());
     let wsarecv_addr = GetProcAddress(ws2, b"WSARecv\0".as_ptr());
+    let recvfrom_addr = GetProcAddress(ws2, b"recvfrom\0".as_ptr());
+    let wsarecvfrom_addr = GetProcAddress(ws2, b"WSARecvFrom\0".as_ptr());
 
     if let Some(send_addr) = send_addr {
         let hook = crate::hook::install(send_addr as usize, send_detour as *const () as usize);
@@ -530,6 +923,36 @@ pub unsafe fn install_packet_hooks() {
         }
     } else {
         crate::paths::log("Failed to resolve send in ws2_32.dll");
+    }
+
+    if let Some(wsasend_addr) = wsasend_addr {
+        let hook = crate::hook::install(wsasend_addr as usize, wsasend_detour as *const () as usize);
+        if let Some(hook) = hook {
+            *WSASEND_HOOK.lock().unwrap() = Some(hook);
+            crate::paths::log("Winsock WSASend hooked successfully");
+        }
+    } else {
+        crate::paths::log("Failed to resolve WSASend in ws2_32.dll");
+    }
+
+    if let Some(sendto_addr) = sendto_addr {
+        let hook = crate::hook::install(sendto_addr as usize, sendto_detour as *const () as usize);
+        if let Some(hook) = hook {
+            *SENDTO_HOOK.lock().unwrap() = Some(hook);
+            crate::paths::log("Winsock sendto hooked successfully");
+        }
+    } else {
+        crate::paths::log("Failed to resolve sendto in ws2_32.dll");
+    }
+
+    if let Some(wsasendto_addr) = wsasendto_addr {
+        let hook = crate::hook::install(wsasendto_addr as usize, wsasendto_detour as *const () as usize);
+        if let Some(hook) = hook {
+            *WSASENDTO_HOOK.lock().unwrap() = Some(hook);
+            crate::paths::log("Winsock WSASendTo hooked successfully");
+        }
+    } else {
+        crate::paths::log("Failed to resolve WSASendTo in ws2_32.dll");
     }
 
     if let Some(recv_addr) = recv_addr {
@@ -550,6 +973,26 @@ pub unsafe fn install_packet_hooks() {
         }
     } else {
         crate::paths::log("Failed to resolve WSARecv in ws2_32.dll");
+    }
+
+    if let Some(recvfrom_addr) = recvfrom_addr {
+        let hook = crate::hook::install(recvfrom_addr as usize, recvfrom_detour as *const () as usize);
+        if let Some(hook) = hook {
+            *RECVFROM_HOOK.lock().unwrap() = Some(hook);
+            crate::paths::log("Winsock recvfrom hooked successfully");
+        }
+    } else {
+        crate::paths::log("Failed to resolve recvfrom in ws2_32.dll");
+    }
+
+    if let Some(wsarecvfrom_addr) = wsarecvfrom_addr {
+        let hook = crate::hook::install(wsarecvfrom_addr as usize, wsarecvfrom_detour as *const () as usize);
+        if let Some(hook) = hook {
+            *WSARECVFROM_HOOK.lock().unwrap() = Some(hook);
+            crate::paths::log("Winsock WSARecvFrom hooked successfully");
+        }
+    } else {
+        crate::paths::log("Failed to resolve WSARecvFrom in ws2_32.dll");
     }
 
     let kernel32 = GetModuleHandleA(b"kernel32.dll\0".as_ptr());
@@ -581,6 +1024,18 @@ pub unsafe fn remove_packet_hooks() {
         hook.remove();
         crate::paths::log("Winsock send unhooked");
     }
+    if let Some(mut hook) = WSASEND_HOOK.lock().unwrap().take() {
+        hook.remove();
+        crate::paths::log("Winsock WSASend unhooked");
+    }
+    if let Some(mut hook) = SENDTO_HOOK.lock().unwrap().take() {
+        hook.remove();
+        crate::paths::log("Winsock sendto unhooked");
+    }
+    if let Some(mut hook) = WSASENDTO_HOOK.lock().unwrap().take() {
+        hook.remove();
+        crate::paths::log("Winsock WSASendTo unhooked");
+    }
     if let Some(mut hook) = RECV_HOOK.lock().unwrap().take() {
         hook.remove();
         crate::paths::log("Winsock recv unhooked");
@@ -588,6 +1043,14 @@ pub unsafe fn remove_packet_hooks() {
     if let Some(mut hook) = WSARECV_HOOK.lock().unwrap().take() {
         hook.remove();
         crate::paths::log("Winsock WSARecv unhooked");
+    }
+    if let Some(mut hook) = RECVFROM_HOOK.lock().unwrap().take() {
+        hook.remove();
+        crate::paths::log("Winsock recvfrom unhooked");
+    }
+    if let Some(mut hook) = WSARECVFROM_HOOK.lock().unwrap().take() {
+        hook.remove();
+        crate::paths::log("Winsock WSARecvFrom unhooked");
     }
     if let Some(mut hook) = GQCS_HOOK.lock().unwrap().take() {
         hook.remove();
