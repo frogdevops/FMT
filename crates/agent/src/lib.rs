@@ -22,3 +22,5 @@ mod hook;
 mod bson;
 #[cfg(target_os = "windows")]
 mod packet;
+#[cfg(target_os = "windows")]
+mod wasm_host;

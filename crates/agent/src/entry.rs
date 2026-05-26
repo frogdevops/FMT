@@ -141,6 +141,8 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     log("  wrote internals.txt");
     log("=== end RAPID CLASS DUMP ===");
 
+    crate::wasm_host::maybe_run_configured();
+
     // Start TCP server
     crate::packet::start_tcp_server();
 
