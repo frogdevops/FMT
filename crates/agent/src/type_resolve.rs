@@ -17,21 +17,6 @@ use crate::il2cpp_ffi::{cstr_to_string, Il2CppApi};
 use crate::paths::log;
 use crate::region_map::{RegionMap, Tunables};
 
-/// String-heap-base derivation proof: when `FROG_PROVE=1`, emit up to `PROOF_CAP`
-/// lines from `build_type_maps`, one per loaded class, showing the candidate
-/// `string_heap_base = name_ptr - nameIndex`. If the candidate is identical across
-/// classes, that's the real base and every type name becomes
-/// `read_name(base + nameIndex)`. Read-only.
-const PROOF_CAP: u32 = 25;
-fn prove_enabled() -> bool {
-    std::env::var("FROG_PROVE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
-}
-static PROOF_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-fn proof_next() -> bool {
-    prove_enabled()
-        && PROOF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < PROOF_CAP
-}
-
 /// Two lookup strategies:
 /// - `td_map`: keyed by `klass + klass_type_def` value (packed typeDefIndex + flags)
 /// - `klass_map`: keyed by klass address (direct pointer)
@@ -154,6 +139,17 @@ fn typedef_name(map: &RegionMap, base: usize, typedef_ptr: usize) -> Option<Stri
     Some(if ns.is_empty() { name } else { format!("{}::{}", ns, name) })
 }
 
+/// Strip the il2cpp generic-arity suffix (a backtick followed by digits) from a
+/// type's leaf name, e.g. "...Dictionary`2" -> "...Dictionary".
+fn strip_arity(name: &str) -> String {
+    match name.rfind('`') {
+        Some(i) if name[i + 1..].chars().all(|c| c.is_ascii_digit()) && i + 1 < name.len() => {
+            name[..i].to_string()
+        }
+        _ => name.to_string(),
+    }
+}
+
 /// Resolve an `Il2CppType*` to a human-readable type name.
 ///
 /// ## Resolution chain (tc = IL2CPP_TYPE_* discriminator)
@@ -178,6 +174,20 @@ pub fn il2cpp_type_name(
     cfg: &Il2CppConfig,
     api: &Il2CppApi,
 ) -> String {
+    il2cpp_type_name_depth(map, type_ptr, type_maps, cfg, api, 0)
+}
+
+fn il2cpp_type_name_depth(
+    map: &RegionMap,
+    type_ptr: usize,
+    type_maps: &TypeMaps,
+    cfg: &Il2CppConfig,
+    api: &Il2CppApi,
+    depth: u8,
+) -> String {
+    if depth > 8 {
+        return "?".into();
+    }
     let data64 = match map.read_u64(type_ptr) {
         Some(v) => v,
         None => return "?".into(),
@@ -213,8 +223,14 @@ pub fn il2cpp_type_name(
             if arr_struct != 0 {
                 if let Some(elem_type_addr) = map.read_u64(arr_struct) {
                     if elem_type_addr != 0 {
-                        let elem_name =
-                            il2cpp_type_name(map, elem_type_addr as usize, type_maps, cfg, api);
+                        let elem_name = il2cpp_type_name_depth(
+                            map,
+                            elem_type_addr as usize,
+                            type_maps,
+                            cfg,
+                            api,
+                            depth + 1,
+                        );
                         return format!("{}[]", elem_name);
                     }
                 }
@@ -222,41 +238,32 @@ pub fn il2cpp_type_name(
             return "System.Array".into();
         }
         0x15 => {
-            // GENERICINST — data64 points to Il2CppGenericClass. PROBE: confirm the
-            // layout by manually resolving ONE level — the generic definition type
-            // (+0x0 = Il2CppType*) and the first type-arg (context.class_inst @ +0x8
-            // = Il2CppGenericInst* { argc@+0, argv@+0x8 = Il2CppType** }). If def
-            // resolves to e.g. "List`1" and arg0 to "Block", the layout is proven and
-            // we wire full recursive rendering. Read-only, FROG_PROVE-gated.
-            if proof_next() {
-                let gc = data64 as usize;
-                let mut hex = String::new();
-                for off in (0..0x20).step_by(8) {
-                    match map.read_u64(gc + off) {
-                        Some(v) => hex.push_str(&format!("+{:#x}={:#018x} ", off, v)),
-                        None => hex.push_str(&format!("+{:#x}=<unmapped> ", off)),
-                    }
-                }
-                let base = type_maps.string_heap_base;
-                // def type @ +0x0 → Il2CppType* → its data (+0) = typedef ptr → name
-                let def_name = map
-                    .read_u64(gc)
-                    .and_then(|tp| map.read_u64(tp as usize))
-                    .and_then(|td| base.and_then(|b| typedef_name(map, b, td as usize)));
-                // class_inst @ +0x8 → Il2CppGenericInst* { argc@+0, argv@+0x8 }
-                let class_inst = map.read_u64(gc + 0x8).unwrap_or(0) as usize;
-                let argc = map.read_u32(class_inst).unwrap_or(0);
-                let argv = map.read_u64(class_inst + 0x8).unwrap_or(0) as usize;
-                let arg0_name = map
-                    .read_u64(argv)
-                    .and_then(|tp| map.read_u64(tp as usize))
-                    .and_then(|td| base.and_then(|b| typedef_name(map, b, td as usize)));
-                log(&format!(
-                    "  GENPROBE gc={:#x}: {}| def={:?} class_inst={:#x} argc={} arg0={:?}",
-                    gc, hex, def_name, class_inst, argc, arg0_name
-                ));
+            let gc = data64 as usize;
+            // Generic definition: gc+0x0 = Il2CppType* of the open generic type.
+            let def = map
+                .read_u64(gc)
+                .map(|tp| il2cpp_type_name_depth(map, tp as usize, type_maps, cfg, api, depth + 1))
+                .unwrap_or_default();
+            if def.is_empty() || def == "?" {
+                return "System.Generic".into();
             }
-            return "System.Generic".into();
+            let base_name = strip_arity(&def);
+            // Type args: gc+0x8 = Il2CppGenericInst* { argc@+0x0, argv@+0x8 (Il2CppType**) }.
+            let class_inst = map.read_u64(gc + 0x8).unwrap_or(0) as usize;
+            let argc = map.read_u32(class_inst).unwrap_or(0) as usize;
+            let argv = map.read_u64(class_inst + 0x8).unwrap_or(0) as usize;
+            let mut args = Vec::new();
+            for i in 0..argc.min(16) {
+                if let Some(arg_tp) = map.read_u64(argv + i * 8) {
+                    args.push(il2cpp_type_name_depth(
+                        map, arg_tp as usize, type_maps, cfg, api, depth + 1,
+                    ));
+                }
+            }
+            if args.is_empty() {
+                return base_name;
+            }
+            return format!("{}<{}>", base_name, args.join(", "));
         }
         0x11 | 0x12 => {
             let p = data64 as usize;
