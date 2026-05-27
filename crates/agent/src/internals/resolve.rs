@@ -13,10 +13,10 @@
 use std::collections::HashMap;
 use std::os::raw::c_void;
 
-use crate::il2cpp_config::Il2CppConfig;
-use crate::il2cpp_ffi::{cstr_to_string, Il2CppApi};
+use crate::internals::config::Il2CppConfig;
+use crate::internals::ffi::{cstr_to_string, Il2CppApi};
 use crate::paths::log;
-use crate::region_map::{RegionMap, Tunables};
+use crate::external::region_map::{RegionMap, Tunables};
 
 /// Generic context for resolving VAR/MVAR type parameters.
 ///

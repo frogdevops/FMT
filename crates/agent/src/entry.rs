@@ -6,14 +6,14 @@ use agent_core::logfile::write_text;
 use agent_core::respect::{should_decline, DeclineReason};
 use windows_sys::Win32::Foundation::{BOOL, HANDLE, HMODULE, TRUE};
 
-use crate::dump_writer::build_internals_lines;
+use crate::internals::dump::build_internals_lines;
 use crate::host;
-use crate::il2cpp_config::Il2CppConfig;
-use crate::il2cpp_ffi::Il2CppApi;
-use crate::mem_scan::{find_class_table, find_types_array, scan_process_for_metadata};
+use crate::internals::config::Il2CppConfig;
+use crate::internals::ffi::Il2CppApi;
+use crate::external::scan::{find_class_table, find_types_array, scan_process_for_metadata};
 use crate::paths::{dump_path, log, log_path};
-use crate::region_map::RegionMap;
-use crate::type_resolve::build_type_maps;
+use crate::external::region_map::RegionMap;
+use crate::internals::resolve::build_type_maps;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
@@ -145,24 +145,24 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     // bounded timer and re-validates sampled klass pointers, to prove whether a
     // one-shot RegionMap holds up for a live session. No-op unless the env is set.
     if std::env::var("FROG_MEM_PROBE").is_ok() {
-        crate::mem_probe::run_staleness_probe(table_base, table_count, &cfg);
+        crate::diagnostics::mem_probe::run_staleness_probe(table_base, table_count, &cfg);
     }
 
     // Opt-in memory WRITE probe (FROG_WRITE_PROBE): proves the guarded write
     // primitive works, its guard rejects bad targets, and a genuine game address
     // is writable. No-op unless the env is set.
     if std::env::var("FROG_WRITE_PROBE").is_ok() {
-        crate::mem_probe::run_write_probe(table_base, table_count, &cfg);
+        crate::diagnostics::mem_probe::run_write_probe(table_base, table_count, &cfg);
     }
 
-    crate::wasm_host::maybe_run_configured();
+    crate::runtime::host::maybe_run_configured();
 
     // Start TCP server
-    crate::packet::start_tcp_server();
+    crate::protocol::start_tcp_server();
 
     // Install packet hooks
     unsafe {
-        crate::packet::install_packet_hooks();
+        crate::protocol::install_packet_hooks();
     }
 
     log("agent running: packet hooks and TCP server active");
@@ -184,7 +184,7 @@ pub extern "system" fn DllMain(_module: HMODULE, reason: u32, _reserved: *mut c_
         }
         DLL_PROCESS_DETACH => {
             unsafe {
-                crate::packet::remove_packet_hooks();
+                crate::protocol::remove_packet_hooks();
             }
         }
         _ => {}

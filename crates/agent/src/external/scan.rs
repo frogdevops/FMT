@@ -18,11 +18,12 @@ use windows_sys::Win32::System::Memory::{
     VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
 };
 
-pub use crate::region_map::{is_readable, RegionMap, Tunables};
+pub use crate::external::region_map::{is_readable, RegionMap, Tunables};
 
-/// Walk this process's committed, readable memory regions looking for the
-/// decrypted global-metadata blob. Returns the first region that parses into a
-/// non-empty `Dump`, along with its absolute address and version. Read-only.
+/// Locate + parse the global-metadata blob in memory. Only succeeds on
+/// **non-obfuscated** games where the metadata magic is present; on Pixel Worlds
+/// the magic is stripped, so this returns `None` and the FFI/class-table path
+/// (the rest of the worker) carries the dump. Kept as the easy-game fallback.
 pub fn scan_process_for_metadata() -> Option<MetadataResult> {
     unsafe {
         let mut addr: usize = 0;

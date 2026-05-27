@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use agent_core::region_churn::{region_churn, Churn};
 
-use crate::il2cpp_config::Il2CppConfig;
-use crate::mem_write::guarded_write;
+use crate::internals::config::Il2CppConfig;
+use crate::external::write::guarded_write;
 use crate::paths::log;
-use crate::region_map::RegionMap;
+use crate::external::region_map::RegionMap;
 
 /// How many snapshots to take and how long to wait between them. Env-overridable
 /// (`FROG_MEM_PROBE_SNAPSHOTS`, `FROG_MEM_PROBE_INTERVAL_MS`) but hard-capped so a
@@ -98,7 +98,7 @@ fn revalidate(map: &RegionMap, samples: &[Sample]) -> usize {
 pub fn run_staleness_probe(table_base: usize, table_count: usize, cfg: &Il2CppConfig) {
     let snapshots = env_capped("FROG_MEM_PROBE_SNAPSHOTS", DEFAULT_SNAPSHOTS as u64, MAX_SNAPSHOTS as u64) as usize;
     let interval = Duration::from_millis(env_capped("FROG_MEM_PROBE_INTERVAL_MS", DEFAULT_INTERVAL_MS, MAX_INTERVAL_MS));
-    let max_regions = crate::region_map::Tunables::load().max_regions;
+    let max_regions = crate::external::region_map::Tunables::load().max_regions;
 
     log("=== MEMORY STALENESS PROBE ===");
     log(&format!(
@@ -212,7 +212,7 @@ pub fn run_write_probe(table_base: usize, table_count: usize, cfg: &Il2CppConfig
     ));
 
     // 3. Real game memory — identical rewrite of a live klass field (no-op value).
-    let map = RegionMap::capture(crate::region_map::Tunables::load().max_regions);
+    let map = RegionMap::capture(crate::external::region_map::Tunables::load().max_regions);
     let step = (table_count / 32).max(1);
     let mut target = None;
     let mut i = 0;

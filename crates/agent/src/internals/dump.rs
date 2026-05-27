@@ -22,12 +22,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::model::{Dump, DumpedClass};
 
-use crate::il2cpp_config::Il2CppConfig;
-use crate::il2cpp_ffi::{cstr_to_string, Il2CppApi};
-use crate::mem_scan::MetadataResult;
+use crate::internals::config::Il2CppConfig;
+use crate::internals::ffi::{cstr_to_string, Il2CppApi};
+use crate::external::scan::MetadataResult;
 use crate::paths::log;
-use crate::region_map::{RegionMap, Tunables};
-use crate::type_resolve::{il2cpp_type_name, GenericCtx, TypeMaps};
+use crate::external::region_map::{RegionMap, Tunables};
+use crate::internals::resolve::{il2cpp_type_name, GenericCtx, TypeMaps};
 
 /// Cached offset of `klass->generic_class`, probed at runtime from the
 /// Il2CppGenericClass::cached_class back-reference.  Once calibrated this
