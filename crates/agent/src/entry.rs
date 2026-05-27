@@ -155,6 +155,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         crate::diagnostics::mem_probe::run_write_probe(table_base, table_count, &cfg);
     }
 
+    crate::external::cache::start_refresher();
     crate::runtime::host::maybe_run_configured();
 
     // Start TCP server

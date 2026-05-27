@@ -17,7 +17,9 @@ pub fn maybe_run_configured() {
             return;
         }
     };
-    match agent_core::wasm::run_wasm(&bytes) {
+    let write_granted = std::env::var("FROG_WASM_WRITE").map(|v| !v.is_empty()).unwrap_or(false);
+    log(&format!("  mem API: read=on, write={}", if write_granted { "GRANTED" } else { "off" }));
+    match crate::runtime::mem_host::run_wasm_with_mem(&bytes, write_granted) {
         Ok(lines) => {
             log(&format!("  WASM ran ok, {} log line(s):", lines.len()));
             for l in &lines {

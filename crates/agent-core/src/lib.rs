@@ -1,4 +1,5 @@
 pub mod logfile;
+pub mod mem_value;
 pub mod mem_write;
 pub mod metadata;
 pub mod model;

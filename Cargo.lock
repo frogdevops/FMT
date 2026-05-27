@@ -10,6 +10,7 @@ dependencies = [
  "iced-x86",
  "serde",
  "serde_json",
+ "wasmi",
  "windows-sys 0.59.0",
 ]
 

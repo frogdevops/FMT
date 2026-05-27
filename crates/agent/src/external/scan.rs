@@ -2,6 +2,7 @@ use std::ffi::c_void;
 
 use agent_core::metadata::{find_and_parse_with_offset, layout_for_version};
 use agent_core::model::Dump;
+use crate::external::cache;
 
 pub struct MetadataResult {
     pub dump: Dump,
@@ -123,6 +124,42 @@ pub fn find_class_table() -> Option<(usize, usize)> {
         }
     }
     best.map(|(base, slots, _)| (base, slots))
+}
+
+/// Find up to `max_hits` addresses where `pattern` occurs in committed-readable
+/// memory. Streaming + bounded: walks cached regions, reads each region's bytes
+/// once, scans with a first-byte skip. No global snapshot-then-search.
+pub fn aob_scan(pattern: &[u8], max_hits: usize) -> Vec<usize> {
+    let mut hits = Vec::new();
+    if pattern.is_empty() || max_hits == 0 {
+        return hits;
+    }
+    let first = pattern[0];
+    for (start, end) in cache::snapshot() {
+        let len = end - start;
+        if len < pattern.len() {
+            continue;
+        }
+        // Region is committed + readable (cache guarantees it); read it as a slice.
+        let bytes = unsafe { std::slice::from_raw_parts(start as *const u8, len) };
+        let mut i = 0;
+        while i + pattern.len() <= len {
+            match bytes[i..len - pattern.len() + 1].iter().position(|&b| b == first) {
+                Some(off) => {
+                    let at = i + off;
+                    if &bytes[at..at + pattern.len()] == pattern {
+                        hits.push(start + at);
+                        if hits.len() >= max_hits {
+                            return hits;
+                        }
+                    }
+                    i = at + 1;
+                }
+                None => break,
+            }
+        }
+    }
+    hits
 }
 
 /// Scan GameAssembly.dll's data section for `Il2CppMetadataRegistration` and
