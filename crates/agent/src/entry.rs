@@ -164,6 +164,11 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         cfg: cfg.clone(),
     });
 
+    // Klass probe must run AFTER ctx::init() so find_class() has a valid context.
+    if std::env::var("FROG_KLASS_PROBE").is_ok() {
+        crate::diagnostics::klass_probe::run_klass_probe();
+    }
+
     crate::runtime::host::maybe_run_configured();
 
     // Start TCP server
