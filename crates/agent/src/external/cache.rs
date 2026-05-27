@@ -68,3 +68,24 @@ fn live_readable(addr: usize, len: usize) -> bool {
 pub fn snapshot() -> Vec<(usize, usize)> {
     regions().read().map(|g| g.regions.clone()).unwrap_or_default()
 }
+
+/// Validated raw reads for structural walks (klass/FieldInfo). Each validates
+/// against the region cache (binary search, miss → VirtualQuery) before reading.
+pub fn read_u64(addr: usize) -> Option<u64> {
+    if validate_read(addr, 8) { Some(unsafe { *(addr as *const u64) }) } else { None }
+}
+pub fn read_u32(addr: usize) -> Option<u32> {
+    if validate_read(addr, 4) { Some(unsafe { *(addr as *const u32) }) } else { None }
+}
+/// NUL-terminated printable-ASCII string (<=255 bytes) at `addr`, validated.
+pub fn read_cstr(addr: usize) -> Option<String> {
+    if !validate_read(addr, 1) { return None; }
+    let mut out = String::new();
+    for i in 0..255usize {
+        let b = read_u32(addr + i).map(|v| (v & 0xFF) as u8)?;
+        if b == 0 { return Some(out); }
+        if !(0x20..=0x7E).contains(&b) { return None; }
+        out.push(b as char);
+    }
+    Some(out)
+}

@@ -90,6 +90,45 @@ fn host_write_if(caller: Caller<'_, HostState>, addr: i64, ty: i32, exp_ptr: i32
     }
 }
 
+fn host_find_class(caller: Caller<'_, HostState>, name_ptr: i32, name_len: i32) -> i64 {
+    let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return 0 };
+    let name = String::from_utf8_lossy(&name);
+    crate::internals::api::find_class(&name) as i64
+}
+
+fn host_field_info(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, name_len: i32) -> i64 {
+    let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return -1 };
+    let name = String::from_utf8_lossy(&name);
+    match crate::internals::api::field_info(klass as u64, &name) {
+        Some((offset, vt)) => ((vt as u8 as i64) << 32) | (offset as i64),
+        None => -1,
+    }
+}
+
+fn host_get_field(mut caller: Caller<'_, HostState>, instance: i64, klass: i64, name_ptr: i32, name_len: i32, out_ptr: i32, out_cap: i32) -> i32 {
+    let name = match read_guest(&caller, name_ptr, name_len) {
+        Some(b) => b,
+        None => return agent_core::mem_value::status::ERR_BAD_TYPE,
+    };
+    let name = String::from_utf8_lossy(&name).into_owned();
+    let value = match crate::internals::api::get_field(instance as u64, klass as u64, &name) {
+        Ok(v) => v,
+        Err(c) => return c,
+    };
+    let bytes = value.encode();
+    if bytes.len() > out_cap.max(0) as usize {
+        return agent_core::mem_value::status::ERR_BUF_TOO_SMALL;
+    }
+    if !write_guest(&mut caller, out_ptr, &bytes) {
+        return agent_core::mem_value::status::ERR_BUF_TOO_SMALL;
+    }
+    bytes.len() as i32
+}
+
+fn host_klass_of(_caller: Caller<'_, HostState>, instance: i64) -> i64 {
+    crate::internals::api::klass_of(instance as u64) as i64
+}
+
 /// Run a module with the mem API. `write_granted` decides whether the write
 /// imports exist at all (the gate). Returns the lines it logged.
 pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<String>, WasmError> {
@@ -105,6 +144,10 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
     linker.func_wrap("mem", "read", host_read).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("mem", "scan", host_scan).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("mem", "regions", host_regions).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "find_class", host_find_class).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "field_info", host_field_info).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "get_field", host_get_field).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "klass_of", host_klass_of).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     if write_granted {
         linker.func_wrap("mem", "write", host_write).map_err(|e| WasmError::Instantiate(e.to_string()))?;
         linker.func_wrap("mem", "write_if", host_write_if).map_err(|e| WasmError::Instantiate(e.to_string()))?;

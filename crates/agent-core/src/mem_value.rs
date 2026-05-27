@@ -110,6 +110,29 @@ pub mod status {
     pub const CHANGED: i32 = 1;
 }
 
+/// Map an il2cpp `Il2CppType` discriminator (`tc`) to the external `ValType` a
+/// field of that type reads as. Numeric primitives map exactly; everything that
+/// is a reference / pointer-sized / inline aggregate reads as `U64` (the pointer,
+/// or the first 8 bytes — chase it); `Void` has no value.
+pub fn valtype_from_tc(tc: u8) -> Option<ValType> {
+    Some(match tc {
+        0x02 => ValType::U8,   // Boolean
+        0x03 => ValType::U16,  // Char
+        0x04 => ValType::I8,   // I1 / SByte
+        0x05 => ValType::U8,   // U1 / Byte
+        0x06 => ValType::I16,  // I2
+        0x07 => ValType::U16,  // U2
+        0x08 => ValType::I32,  // I4 / Int32
+        0x09 => ValType::U32,  // U4 / UInt32
+        0x0A => ValType::I64,  // I8 / Int64
+        0x0B => ValType::U64,  // U8 / UInt64
+        0x0C => ValType::F32,  // R4 / Single
+        0x0D => ValType::F64,  // R8 / Double
+        0x01 => return None,   // Void — no value
+        _ => ValType::U64,     // String/Object/CLASS/ARRAY/IntPtr/GENERICINST/… → pointer-sized
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +181,25 @@ mod tests {
     #[test]
     fn val_type_reports_back() {
         assert_eq!(Value::I64(-1).val_type(), ValType::I64);
+    }
+
+    #[test]
+    fn tc_numeric_primitives_map_exact() {
+        assert_eq!(valtype_from_tc(0x02), Some(ValType::U8));   // Boolean
+        assert_eq!(valtype_from_tc(0x03), Some(ValType::U16));  // Char
+        assert_eq!(valtype_from_tc(0x04), Some(ValType::I8));   // I1
+        assert_eq!(valtype_from_tc(0x05), Some(ValType::U8));   // U1
+        assert_eq!(valtype_from_tc(0x08), Some(ValType::I32));  // I4
+        assert_eq!(valtype_from_tc(0x0A), Some(ValType::I64));  // I8
+        assert_eq!(valtype_from_tc(0x0C), Some(ValType::F32));  // R4
+        assert_eq!(valtype_from_tc(0x0D), Some(ValType::F64));  // R8
+    }
+
+    #[test]
+    fn tc_void_is_none_refs_are_u64() {
+        assert_eq!(valtype_from_tc(0x01), None);               // Void
+        assert_eq!(valtype_from_tc(0x0E), Some(ValType::U64)); // String (ref → ptr)
+        assert_eq!(valtype_from_tc(0x12), Some(ValType::U64)); // CLASS (ref → ptr)
+        assert_eq!(valtype_from_tc(0x1C), Some(ValType::U64)); // Object
     }
 }

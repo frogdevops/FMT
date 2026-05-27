@@ -156,6 +156,14 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     }
 
     crate::external::cache::start_refresher();
+
+    crate::internals::ctx::init(crate::internals::ctx::InternalsCtx {
+        table_base,
+        table_count,
+        api: api.clone(),
+        cfg: cfg.clone(),
+    });
+
     crate::runtime::host::maybe_run_configured();
 
     // Start TCP server

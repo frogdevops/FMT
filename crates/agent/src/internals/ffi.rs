@@ -32,6 +32,7 @@ type ImageGetName = unsafe extern "C" fn(*mut Il2CppImage) -> *const c_char;
 /// invoked through transmuted function pointers — the lint can't see across
 /// FFI boundaries. They are all called from the dump pipeline.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct Il2CppApi {
     pub domain_get: DomainGet,
     pub domain_get_assemblies: DomainGetAssemblies,
