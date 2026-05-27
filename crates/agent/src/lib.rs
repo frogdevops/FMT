@@ -24,3 +24,7 @@ mod bson;
 mod packet;
 #[cfg(target_os = "windows")]
 mod wasm_host;
+#[cfg(target_os = "windows")]
+mod mem_write;
+#[cfg(target_os = "windows")]
+mod mem_probe;

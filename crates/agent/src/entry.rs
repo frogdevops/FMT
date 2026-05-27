@@ -141,6 +141,20 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     log("  wrote internals.txt");
     log("=== end RAPID CLASS DUMP ===");
 
+    // Opt-in memory staleness probe (FROG_MEM_PROBE): re-snapshots regions on a
+    // bounded timer and re-validates sampled klass pointers, to prove whether a
+    // one-shot RegionMap holds up for a live session. No-op unless the env is set.
+    if std::env::var("FROG_MEM_PROBE").is_ok() {
+        crate::mem_probe::run_staleness_probe(table_base, table_count, &cfg);
+    }
+
+    // Opt-in memory WRITE probe (FROG_WRITE_PROBE): proves the guarded write
+    // primitive works, its guard rejects bad targets, and a genuine game address
+    // is writable. No-op unless the env is set.
+    if std::env::var("FROG_WRITE_PROBE").is_ok() {
+        crate::mem_probe::run_write_probe(table_base, table_count, &cfg);
+    }
+
     crate::wasm_host::maybe_run_configured();
 
     // Start TCP server
