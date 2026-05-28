@@ -39,7 +39,12 @@ fn for_each_field(klass: usize, mut f: impl FnMut(&str, u32, usize) -> bool) {
             if fi.is_null() { break; }
             let name = unsafe { cstr_to_string((c.api.field_get_name)(fi)) };
             let type_ptr = unsafe { (c.api.field_get_type)(fi) } as usize;
-            let offset = cache::read_u32(fi as usize + 24).unwrap_or(0);
+            let raw_offset = cache::read_u32(fi as usize + 24).unwrap_or(0);
+            let offset = if klass_is_valuetype(klass as u64) {
+                raw_offset.saturating_sub(0x10)
+            } else {
+                raw_offset
+            };
             if f(&name, offset, type_ptr) { return; }
         }
     } else {
@@ -51,8 +56,15 @@ fn for_each_field(klass: usize, mut f: impl FnMut(&str, u32, usize) -> bool) {
             let slot = fields_ptr + fi * 32;
             let name_ptr = match cache::read_u64(slot) { Some(p) if p != 0 => p as usize, _ => break };
             let name = match cache::read_cstr(name_ptr) { Some(n) if !n.is_empty() => n, _ => continue };
+            let token = cache::read_u32(slot + 28).unwrap_or(0);
+            if token == 0 { continue; }   // scanner garbage: real fields always have a metadata token
             let type_ptr = cache::read_u64(slot + 8).unwrap_or(0) as usize;
-            let offset = cache::read_u32(slot + 24).unwrap_or(0);
+            let raw_offset = cache::read_u32(slot + 24).unwrap_or(0);
+            let offset = if klass_is_valuetype(klass as u64) {
+                raw_offset.saturating_sub(0x10)
+            } else {
+                raw_offset
+            };
             if f(&name, offset, type_ptr) { return; }
         }
     }
@@ -147,6 +159,26 @@ pub fn find_method(klass: u64, name: &str, argc: u32) -> u64 {
         }
     }
     0
+}
+
+/// True if the klass is a value type. Reads `Il2CppClass.byval_arg`'s valuetype
+/// bit via the probed offset+mask. Falls back to false on unreadable klass.
+pub fn klass_is_valuetype(klass: u64) -> bool {
+    let c = match ctx::get() { Some(c) => c, None => return false };
+    let byte = cache::read_u8(klass as usize + c.cfg.klass_valuetype_off).unwrap_or(0);
+    byte & c.cfg.klass_valuetype_bit != 0
+}
+
+/// Map-backed variant of `klass_is_valuetype` for dump-time use, when
+/// `ctx::init` has not yet been called and the cache refresher hasn't started.
+/// Reads via the captured `RegionMap` snapshot using the explicitly-passed cfg.
+pub fn klass_is_valuetype_via_map(
+    klass: u64,
+    cfg: &crate::internals::config::Il2CppConfig,
+    map: &crate::external::region_map::RegionMap,
+) -> bool {
+    let byte = map.read_u8(klass as usize + cfg.klass_valuetype_off).unwrap_or(0);
+    byte & cfg.klass_valuetype_bit != 0
 }
 
 /// Typed sibling of `find_class`. Returns `Some(KlassPtr)` when found, `None`

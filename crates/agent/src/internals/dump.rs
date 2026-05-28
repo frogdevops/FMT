@@ -346,8 +346,14 @@ fn collect_runtime_fields(
             } else {
                 "?".to_string()
             };
-            let offset = map.read_u32(f as usize + 24).unwrap_or(0);
+            let raw_offset = map.read_u32(f as usize + 24).unwrap_or(0);
+            let offset = if crate::internals::api::klass_is_valuetype_via_map(cls as u64, cfg, map) {
+                raw_offset.saturating_sub(0x10)
+            } else {
+                raw_offset
+            };
             let token = map.read_u32(f as usize + 28).unwrap_or(0);
+            if token == 0 { continue; }   // scanner garbage: real fields always have a metadata token
             rt_fields.push((fname, ftype, offset, token));
         }
     } else {
@@ -379,8 +385,14 @@ fn collect_runtime_fields(
                 } else {
                     "?".to_string()
                 };
-                let offset = map.read_u32(f + 24).unwrap_or(0);
+                let raw_offset = map.read_u32(f + 24).unwrap_or(0);
+                let offset = if crate::internals::api::klass_is_valuetype_via_map(cls as usize as u64, cfg, map) {
+                    raw_offset.saturating_sub(0x10)
+                } else {
+                    raw_offset
+                };
                 let token = map.read_u32(f + 28).unwrap_or(0);
+                if token == 0 { continue; }   // scanner garbage: real fields always have a metadata token
                 rt_fields.push((fname, ftype, offset, token));
             }
         }

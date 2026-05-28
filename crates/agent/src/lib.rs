@@ -5,6 +5,8 @@ mod host;
 #[cfg(target_os = "windows")]
 mod paths;
 #[cfg(target_os = "windows")]
+mod inline_detour;
+#[cfg(target_os = "windows")]
 mod protocol;
 #[cfg(target_os = "windows")]
 mod external;

@@ -3,6 +3,5 @@
 //! Decoding (BSON, etc.) is the consumer's job, not the backend's.
 
 pub mod capture;
-pub mod hook;
 
 pub use capture::{install_packet_hooks, remove_packet_hooks, start_tcp_server};

@@ -172,6 +172,13 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     if std::env::var("FROG_MEMBER_PROBE").is_ok() {
         crate::diagnostics::klass_probe::run_member_probe();
     }
+    // Opt-in valuetype-flag offset probe (FROG_VALUETYPE_PROBE): diffs System.Int32
+    // (value type) against System.String (reference type) to derive the
+    // Il2CppClass::valuetype flag offset+bit. Results are logged for operator review
+    // and banked into internals/config.rs (Task 3).
+    if std::env::var("FROG_VALUETYPE_PROBE").is_ok() {
+        crate::diagnostics::valuetype_probe::run_valuetype_probe();
+    }
 
     crate::runtime::host::maybe_run_configured();
 

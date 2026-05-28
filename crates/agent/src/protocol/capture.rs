@@ -169,7 +169,7 @@ pub struct OVERLAPPED_ENTRY {
 thread_local! { static IN_HOOK: std::cell::Cell<bool> = std::cell::Cell::new(false); }
 
 /// Vec of installed Hooks; drained on remove.
-static HOOKS: Mutex<Vec<crate::protocol::hook::Hook>> = Mutex::new(Vec::new());
+static HOOKS: Mutex<Vec<crate::inline_detour::Hook>> = Mutex::new(Vec::new());
 
 /// Count of APC-completion recvs we could not observe (no IOCP path).
 static APC_GAP: AtomicU64 = AtomicU64::new(0);
@@ -579,7 +579,7 @@ pub unsafe fn install_packet_hooks() {
             let addr_opt = GetProcAddress($module, $sym.as_ptr());
             if let Some(addr) = addr_opt {
                 let addr_usize = addr as usize;
-                if let Some(h) = crate::protocol::hook::install(addr_usize, $detour as *const () as usize) {
+                if let Some(h) = crate::inline_detour::install(addr_usize, $detour as *const () as usize) {
                     let _ = $orig.set(h.trampoline);
                     if let Ok(mut hooks) = HOOKS.lock() { hooks.push(h); }
                 }

@@ -76,6 +76,13 @@ pub struct Il2CppConfig {
     pub method_klass_off: usize,
     /// MethodInfo → parameters_count (u8).
     pub method_param_count_off: usize,
+
+    /// Offset of the byte containing the valuetype bit in Il2CppClass.byval_arg.
+    /// Derived structurally via diagnostics::valuetype_probe (cross-validated on
+    /// 5 value types + 4 reference types; 0x2B/0x80 = bit 31 of the Il2CppType
+    /// bitfield, the valuetype bit per standard il2cpp ABI).
+    pub klass_valuetype_off: usize,
+    pub klass_valuetype_bit: u8,
 }
 
 impl Il2CppConfig {
@@ -136,6 +143,8 @@ impl Il2CppConfig {
             method_name_off:             0x18,
             method_klass_off:            0x20,
             method_param_count_off:      0x52,
+            klass_valuetype_off:         0x2B,
+            klass_valuetype_bit:         0x80,
         }
     }
 
@@ -181,6 +190,8 @@ impl Il2CppConfig {
             method_name_off:             0x18,
             method_klass_off:            0x20,
             method_param_count_off:      0x52,
+            klass_valuetype_off:         0x2B,
+            klass_valuetype_bit:         0x80,
         }
     }
 }
