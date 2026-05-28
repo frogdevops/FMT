@@ -179,6 +179,9 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     if std::env::var("FROG_VALUETYPE_PROBE").is_ok() {
         crate::diagnostics::valuetype_probe::run_valuetype_probe();
     }
+    if std::env::var("FROG_METHODINFO_PROBE").is_ok() {
+        crate::diagnostics::methodinfo_probe::run_methodinfo_probe();
+    }
 
     crate::runtime::host::maybe_run_configured();
 

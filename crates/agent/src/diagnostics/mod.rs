@@ -3,3 +3,4 @@
 pub mod mem_probe;
 pub mod klass_probe;
 pub mod valuetype_probe;
+pub mod methodinfo_probe;
