@@ -168,6 +168,10 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     if std::env::var("FROG_KLASS_PROBE").is_ok() {
         crate::diagnostics::klass_probe::run_klass_probe();
     }
+    // Round-2 recon: MethodInfo layout + FieldInfo static flag.
+    if std::env::var("FROG_MEMBER_PROBE").is_ok() {
+        crate::diagnostics::klass_probe::run_member_probe();
+    }
 
     crate::runtime::host::maybe_run_configured();
 

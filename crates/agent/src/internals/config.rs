@@ -64,6 +64,18 @@ pub struct Il2CppConfig {
     /// Number of bits to right‑shift the chunk so that the lowest byte
     /// becomes the discriminator.
     pub discrim_shift: u8,
+
+    // ── Il2CppClass method / static-field accessors ───────────────
+    /// klass → MethodInfo** array (the class's own methods). = klass_fields + 0x18.
+    pub klass_methods: usize,
+    /// klass → static-fields storage base pointer. = klass_fields + 0x38.
+    pub klass_static_fields: usize,
+    /// MethodInfo → name (const char*).
+    pub method_name_off: usize,
+    /// MethodInfo → declaring klass (Il2CppClass*); doubles as array-end sentinel.
+    pub method_klass_off: usize,
+    /// MethodInfo → parameters_count (u8).
+    pub method_param_count_off: usize,
 }
 
 impl Il2CppConfig {
@@ -119,6 +131,11 @@ impl Il2CppConfig {
             klass_fields:                0x80,
             il2cpp_type_discrim_read_at: 0x08,
             discrim_shift:               16,
+            klass_methods:               0x98,
+            klass_static_fields:         0xB8,
+            method_name_off:             0x18,
+            method_klass_off:            0x20,
+            method_param_count_off:      0x52,
         }
     }
 
@@ -159,6 +176,11 @@ impl Il2CppConfig {
             klass_fields:                0x70,   // guessed (shifted by −16)
             il2cpp_type_discrim_read_at: 0x08,
             discrim_shift:               16,
+            klass_methods:               0x88,   // klass_fields (0x70) + 0x18
+            klass_static_fields:         0xA8,   // klass_fields (0x70) + 0x38
+            method_name_off:             0x18,
+            method_klass_off:            0x20,
+            method_param_count_off:      0x52,
         }
     }
 }

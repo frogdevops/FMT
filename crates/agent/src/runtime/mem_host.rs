@@ -129,6 +129,16 @@ fn host_klass_of(_caller: Caller<'_, HostState>, instance: i64) -> i64 {
     crate::internals::api::klass_of(instance as u64) as i64
 }
 
+fn host_static_field(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, name_len: i32) -> i64 {
+    let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return 0 };
+    crate::internals::api::static_field(klass as u64, &String::from_utf8_lossy(&name)) as i64
+}
+
+fn host_find_method(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, name_len: i32, argc: i32) -> i64 {
+    let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return 0 };
+    crate::internals::api::find_method(klass as u64, &String::from_utf8_lossy(&name), argc.max(0) as u32) as i64
+}
+
 /// Run a module with the mem API. `write_granted` decides whether the write
 /// imports exist at all (the gate). Returns the lines it logged.
 pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<String>, WasmError> {
@@ -148,6 +158,8 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
     linker.func_wrap("il2cpp", "field_info", host_field_info).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "get_field", host_get_field).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "klass_of", host_klass_of).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "static_field", host_static_field).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "find_method", host_find_method).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     if write_granted {
         linker.func_wrap("mem", "write", host_write).map_err(|e| WasmError::Instantiate(e.to_string()))?;
         linker.func_wrap("mem", "write_if", host_write_if).map_err(|e| WasmError::Instantiate(e.to_string()))?;

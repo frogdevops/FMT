@@ -90,3 +90,60 @@ pub fn get_field(instance: u64, klass: u64, name: &str) -> Result<Value, i32> {
 pub fn klass_of(instance: u64) -> u64 {
     cache::read_u64(instance as usize).unwrap_or(0)
 }
+
+/// Address of a static field by name (no instance needed). 0 = not found / not static.
+/// static base = klass + klass_static_fields; a field is static iff its type-attrs
+/// (low 16 bits of the discriminator chunk) have FIELD_ATTRIBUTE_STATIC (0x10).
+pub fn static_field(klass: u64, name: &str) -> u64 {
+    let c = match ctx::get() { Some(c) => c, None => return 0 };
+    let k = klass as usize;
+    let static_base = cache::read_u64(k + c.cfg.klass_static_fields).unwrap_or(0);
+    if static_base == 0 {
+        return 0;
+    }
+    let mut addr = 0u64;
+    for_each_field(k, |fname, offset, type_ptr| {
+        if fname == name {
+            let chunk = cache::read_u64(type_ptr + c.cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
+            if chunk & 0x10 != 0 {
+                addr = static_base + offset as u64;
+            }
+            true
+        } else {
+            false
+        }
+    });
+    addr
+}
+
+/// Locate a method by name + arg count → MethodInfo* (the handle), or 0.
+/// Walks the klass's methods array (klass + klass_methods); stops at the array end
+/// when an entry's klass back-pointer no longer matches (no method_count needed).
+pub fn find_method(klass: u64, name: &str, argc: u32) -> u64 {
+    let c = match ctx::get() { Some(c) => c, None => return 0 };
+    let k = klass as usize;
+    let methods = cache::read_u64(k + c.cfg.klass_methods).unwrap_or(0) as usize;
+    if methods == 0 {
+        return 0;
+    }
+    for i in 0..4096usize {
+        let mi = match cache::read_u64(methods + i * 8) {
+            Some(v) if v != 0 => v as usize,
+            _ => break,
+        };
+        // Array-end / validity: the MethodInfo's declaring-klass must be this klass.
+        if cache::read_u64(mi + c.cfg.method_klass_off).unwrap_or(0) != klass {
+            break;
+        }
+        let name_ptr = cache::read_u64(mi + c.cfg.method_name_off).unwrap_or(0) as usize;
+        let mname = match cache::read_cstr(name_ptr) {
+            Some(n) if !n.is_empty() => n,
+            _ => break,
+        };
+        let pcount = cache::read_u8(mi + c.cfg.method_param_count_off).unwrap_or(0) as u32;
+        if mname == name && pcount == argc {
+            return mi as u64;
+        }
+    }
+    0
+}
