@@ -215,7 +215,7 @@ pub fn find_types_array(type_count: u32, map: &RegionMap) -> Option<usize> {
                 let mut i = 0usize;
                 while i + 28 <= slice.len() {
                     // typesCount must appear at offset 12 within the struct
-                    if i >= 12 && slice[i - 12..i - 8] == needle {
+                    if i >= 12 && slice[i..i + 4] == needle {
                         // Found candidate: read the types pointer at offset 24 (12 + 12 = 24)
                         // Also try offset 20 (no padding) for older layouts
                         for types_off in [20usize, 24] {

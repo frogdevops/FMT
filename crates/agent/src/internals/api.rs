@@ -17,6 +17,7 @@ pub fn find_class(name: &str) -> u64 {
     for i in 0..c.table_count {
         let slot = c.table_base.wrapping_add(i * c.cfg.class_table_step);
         let klass = match cache::read_u64(slot) { Some(k) if k != 0 => k as usize, _ => continue };
+        if !cache::is_klass_shape(klass) { continue; }
         let cn = unsafe { cstr_to_string((c.api.class_get_name)(klass as *mut Il2CppClass)) };
         if cn.is_empty() { continue; }
         if cn == name { return klass as u64; }
@@ -49,7 +50,7 @@ fn for_each_field(klass: usize, mut f: impl FnMut(&str, u32, usize) -> bool) {
         for fi in 0..256usize {
             let slot = fields_ptr + fi * 32;
             let name_ptr = match cache::read_u64(slot) { Some(p) if p != 0 => p as usize, _ => break };
-            let name = match cache::read_cstr(name_ptr) { Some(n) if !n.is_empty() => n, _ => break };
+            let name = match cache::read_cstr(name_ptr) { Some(n) if !n.is_empty() => n, _ => continue };
             let type_ptr = cache::read_u64(slot + 8).unwrap_or(0) as usize;
             let offset = cache::read_u32(slot + 24).unwrap_or(0);
             if f(&name, offset, type_ptr) { return; }
@@ -138,7 +139,7 @@ pub fn find_method(klass: u64, name: &str, argc: u32) -> u64 {
         let name_ptr = cache::read_u64(mi + c.cfg.method_name_off).unwrap_or(0) as usize;
         let mname = match cache::read_cstr(name_ptr) {
             Some(n) if !n.is_empty() => n,
-            _ => break,
+            _ => continue,
         };
         let pcount = cache::read_u8(mi + c.cfg.method_param_count_off).unwrap_or(0) as u32;
         if mname == name && pcount == argc {

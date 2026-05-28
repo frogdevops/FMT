@@ -336,7 +336,7 @@ fn collect_runtime_fields(
             if f.is_null() {
                 break;
             }
-            if rt_fields.len() >= 30 {
+            if rt_fields.len() >= MAX_FIELDS_PER_CLASS {
                 break;
             }
             let fname = unsafe { cstr_to_string((api.field_get_name)(f)) };
@@ -368,10 +368,10 @@ fn collect_runtime_fields(
                 }
                 let fname = match map.read_name(name_ptr) {
                     Some(n) => n,
-                    None => break,
+                    None => continue,
                 };
                 if fname.is_empty() {
-                    break;
+                    continue;
                 }
                 let type_ptr = map.read_u64(f + 8).unwrap_or(0) as usize;
                 let ftype = if type_ptr != 0 {

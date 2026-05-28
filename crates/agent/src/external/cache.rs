@@ -80,15 +80,39 @@ pub fn read_u32(addr: usize) -> Option<u32> {
 pub fn read_u8(addr: usize) -> Option<u8> {
     if validate_read(addr, 1) { Some(unsafe { *(addr as *const u8) }) } else { None }
 }
-/// NUL-terminated printable-ASCII string (<=255 bytes) at `addr`, validated.
+/// NUL-terminated string at `addr`, validated. Reads up to 255 bytes one at a
+/// time (page-boundary safe — never tries to read past a region edge). Accepts
+/// ALL non-zero bytes and decodes with lossy UTF-8, so obfuscated/non-ASCII
+/// names resolve (matches `cstr_to_string` in `internals/ffi.rs`).
 pub fn read_cstr(addr: usize) -> Option<String> {
-    if !validate_read(addr, 1) { return None; }
-    let mut out = String::new();
+    let mut bytes = Vec::with_capacity(64);
     for i in 0..255usize {
-        let b = read_u32(addr + i).map(|v| (v & 0xFF) as u8)?;
-        if b == 0 { return Some(out); }
-        if !(0x20..=0x7E).contains(&b) { return None; }
-        out.push(b as char);
+        let b = read_u8(addr + i)?;
+        if b == 0 {
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        bytes.push(b);
     }
-    Some(out)
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Cheap shape check: does `addr` look like an Il2CppClass? Validates the
+/// image-backptr chain (klass+0 → Il2CppImage whose +0 → name string ending in
+/// ".dll"). Use this to gate FFI calls on potentially-garbage class-table slots.
+pub fn is_klass_shape(addr: usize) -> bool {
+    if addr == 0 {
+        return false;
+    }
+    let image_ptr = match read_u64(addr) {
+        Some(p) if p != 0 => p as usize,
+        _ => return false,
+    };
+    let name_ptr = match read_u64(image_ptr) {
+        Some(p) if p != 0 => p as usize,
+        _ => return false,
+    };
+    match read_cstr(name_ptr) {
+        Some(s) => s.len() > 4 && s.ends_with(".dll"),
+        None => false,
+    }
 }

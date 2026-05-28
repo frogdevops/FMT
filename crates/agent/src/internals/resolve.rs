@@ -67,6 +67,10 @@ pub fn build_type_maps(
                         continue;
                     }
                     let td = td as usize;
+                    // Guard: skip slots that don't look like a klass struct (image-backptr → *.dll).
+                    if map.class_fields(k).is_none() {
+                        continue;
+                    }
                     // Guard: skip zero/garbage slots that have no readable name.
                     if unsafe { cstr_to_string((api.class_get_name)(k as *mut c_void)) }.is_empty() {
                         continue;
