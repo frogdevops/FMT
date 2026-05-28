@@ -6,4 +6,5 @@ pub mod model;
 pub mod protocol;
 pub mod region_churn;
 pub mod respect;
+pub mod spine;
 pub mod wasm;

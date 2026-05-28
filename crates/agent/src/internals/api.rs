@@ -148,3 +148,66 @@ pub fn find_method(klass: u64, name: &str, argc: u32) -> u64 {
     }
     0
 }
+
+/// Typed sibling of `find_class`. Returns `Some(KlassPtr)` when found, `None`
+/// otherwise. Uses the spine vocabulary; raw `find_class` remains for the
+/// existing WASM-host call site.
+pub fn find_class_t(name: &str) -> Option<agent_core::spine::KlassPtr> {
+    match find_class(name) {
+        0 => None,
+        k => Some(agent_core::spine::KlassPtr::from_raw(k)),
+    }
+}
+
+/// Typed sibling of `find_method`. Returns `Some(MethodPtr)` when found.
+pub fn find_method_t(
+    klass: agent_core::spine::KlassPtr,
+    name: &str,
+    argc: u32,
+) -> Option<agent_core::spine::MethodPtr> {
+    match find_method(klass.as_u64(), name, argc) {
+        0 => None,
+        m => Some(agent_core::spine::MethodPtr::from_raw(m)),
+    }
+}
+
+/// Typed address of an instance field: `instance + field_info(klass, name).offset`.
+/// Returns `MemAddr<ReadWrite>` — instance fields are writable by intent.
+/// Returns `None` if the field is not found on the class.
+pub fn field_addr_t(
+    klass: agent_core::spine::KlassPtr,
+    name: &str,
+    instance: agent_core::spine::Instance,
+) -> Option<agent_core::spine::MemAddr<agent_core::spine::ReadWrite>> {
+    let (offset, _vt) = field_info(klass.as_u64(), name)?;
+    let addr = (instance.as_u64() as usize).wrapping_add(offset as usize) as u64;
+    // SAFETY: caller obtained `instance` via the spine API; instance fields
+    // are writable by their semantic role.
+    Some(unsafe { agent_core::spine::MemAddr::from_raw_writable(addr) })
+}
+
+/// Typed address of a static field. Returns `MemAddr<ReadWrite>` — statics
+/// are writable by intent. Returns `None` if the field is not found or not
+/// actually static on this class.
+pub fn static_field_t(
+    klass: agent_core::spine::KlassPtr,
+    name: &str,
+) -> Option<agent_core::spine::MemAddr<agent_core::spine::ReadWrite>> {
+    match static_field(klass.as_u64(), name) {
+        0 => None,
+        // SAFETY: static_field returns 0 unless the field is actually marked
+        // FIELD_ATTRIBUTE_STATIC; the static base lives in a writable region.
+        a => Some(unsafe { agent_core::spine::MemAddr::from_raw_writable(a) }),
+    }
+}
+
+/// Typed sibling of `klass_of`. Returns `None` if the instance head is
+/// unreadable or zero.
+pub fn klass_of_t(
+    instance: agent_core::spine::Instance,
+) -> Option<agent_core::spine::KlassPtr> {
+    match klass_of(instance.as_u64()) {
+        0 => None,
+        k => Some(agent_core::spine::KlassPtr::from_raw(k)),
+    }
+}
