@@ -1,20 +1,21 @@
 //! One-shot probe (opt-in `FROG_METHODINFO_PROBE`): derives the 5 MethodInfo /
-//! ParamInfo offsets structurally. Anchors on `System::Math::Pow(double, double)`
-//! — single overload, return type R8 (tc=0x0D), both params R8 (tc=0x0D). Falls
-//! back to `System::Single::IsNaN(float)` if Math.Pow not present.
+//! ParamInfo offsets structurally.
 //!
-//! v3 over v2: unambiguous anchor + raw hex dump of the candidate parameters
-//! base so the operator sees the actual ParameterInfo layout instead of
-//! guessing strides.
+//! v4: keeps the v3 Math.Pow / Single.IsNaN anchor for the first 4 offsets,
+//! adds a second anchor (`System::String::PadLeft(Int32, Char)`) specifically
+//! for `param_info_size` — its two params have distinct tcs (I4=0x08 and
+//! CHAR=0x03) so the right stride is unambiguous.
 
 use crate::external::cache;
 use crate::internals::api;
 use crate::internals::ctx;
 use crate::paths::log;
 
-const IL2CPP_TYPE_R8: u8 = 0x0D;
-const IL2CPP_TYPE_R4: u8 = 0x0C;
 const IL2CPP_TYPE_BOOLEAN: u8 = 0x02;
+const IL2CPP_TYPE_CHAR:    u8 = 0x03;
+const IL2CPP_TYPE_I4:      u8 = 0x08;
+const IL2CPP_TYPE_R4:      u8 = 0x0C;
+const IL2CPP_TYPE_R8:      u8 = 0x0D;
 
 fn read_tc(type_ptr: usize) -> u8 {
     let c = match ctx::get() { Some(c) => c, None => return 0 };
@@ -43,100 +44,81 @@ struct Anchor {
     name: &'static str,
 }
 
-const ANCHORS: &[Anchor] = &[
-    Anchor { class: "System::Math",   method: "Pow",   argc: 2, return_tc: IL2CPP_TYPE_R8, param_tc: IL2CPP_TYPE_R8, name: "R8 (double)" },
-    Anchor { class: "System::Single", method: "IsNaN", argc: 1, return_tc: IL2CPP_TYPE_BOOLEAN, param_tc: IL2CPP_TYPE_R4, name: "R4 (float)" },
+const ANCHORS_RETURN_PARAMS: &[Anchor] = &[
+    Anchor { class: "System::Math",   method: "Pow",   argc: 2, return_tc: IL2CPP_TYPE_R8,      param_tc: IL2CPP_TYPE_R8, name: "R8" },
+    Anchor { class: "System::Single", method: "IsNaN", argc: 1, return_tc: IL2CPP_TYPE_BOOLEAN, param_tc: IL2CPP_TYPE_R4, name: "R4" },
 ];
 
 pub fn run_methodinfo_probe() {
-    log("=== METHODINFO PROBE v3 (unambiguous anchor + raw dump) ===");
+    log("=== METHODINFO PROBE v4 ===");
 
-    let (anchor, _klass, method) = {
-        let mut found = None;
-        for a in ANCHORS {
-            let k = api::find_class(a.class);
-            if k == 0 { log(&format!("anchor {}: class not found", a.class)); continue; }
-            let m = api::find_method(k, a.method, a.argc);
-            if m == 0 { log(&format!("anchor {}::{}({}) not found", a.class, a.method, a.argc)); continue; }
-            log(&format!("anchor: {}::{}({}) @ {:#x}  (return={}, params={})",
-                         a.class, a.method, a.argc, m, a.name, a.name));
-            found = Some((a, k, m));
-            break;
-        }
-        match found {
-            Some(t) => t,
-            None => { log("methodinfo probe: no usable anchor found"); return; }
-        }
+    // ── Phase A — same-type anchor to lock 4 offsets ─────────────────────
+    log("--- phase A: same-type anchor (locks return/parameters/flags/type_off) ---");
+    let mut found_a = None;
+    for a in ANCHORS_RETURN_PARAMS {
+        let k = api::find_class(a.class);
+        if k == 0 { continue; }
+        let m = api::find_method(k, a.method, a.argc);
+        if m == 0 { continue; }
+        log(&format!("phase A anchor: {}::{}({}) @ {:#x}", a.class, a.method, a.argc, m));
+        found_a = Some((a, m));
+        break;
+    }
+    let (anchor_a, method_a) = match found_a {
+        Some(x) => x,
+        None => { log("phase A: no anchor found, aborting"); return; }
     };
 
-    // ── 1. return_type at +0x28 — sanity check ─────────────────────────
-    log("--- return_type sanity (expect tc to match anchor's return type) ---");
-    let rt = cache::read_u64(method as usize + 0x28).unwrap_or(0);
-    log(&format!("  +0x28  {}", classify("return_type", rt, anchor.return_tc, anchor.name)));
+    // return_type at +0x28
+    let rt = cache::read_u64(method_a as usize + 0x28).unwrap_or(0);
+    log(&format!("  return_type +0x28  {}", classify("ret", rt, anchor_a.return_tc, anchor_a.name)));
 
-    // ── 2. Scan +0x28..+0x60 for parameters ptr — looking for a ptr whose
-    //       deref+type_off lookup yields anchor.param_tc ────────────────
-    log("--- scanning +0x28..+0x60 for parameters base (deref + check param[0].type tc) ---");
-    let mut param_base_candidates: Vec<(usize, u64)> = Vec::new();
-    for off in (0x28..0x60usize).step_by(8) {
-        let base_ptr = cache::read_u64(method as usize + off).unwrap_or(0);
-        if base_ptr == 0 || base_ptr < 0x10000 { continue; }
-        // For each candidate type_off inside ParameterInfo, check tc.
-        let mut hit = None;
-        for type_off in [0x00usize, 0x08, 0x10, 0x18, 0x20] {
-            let type_ptr = cache::read_u64(base_ptr as usize + type_off).unwrap_or(0);
-            if type_ptr == 0 || type_ptr < 0x10000 { continue; }
-            let tc = read_tc(type_ptr as usize);
-            if tc == anchor.param_tc {
-                hit = Some((type_off, type_ptr, tc));
-                break;
-            }
-        }
-        match hit {
-            Some((to, tp, tc)) => {
-                log(&format!("  +{:#04x}  base={:#x}  type_off={:#04x}  type_ptr={:#x} tc={:#04x} MATCH",
-                             off, base_ptr, to, tp, tc));
-                param_base_candidates.push((off, base_ptr));
-            }
-            None => {
-                log(&format!("  +{:#04x}  base={:#x}  no param_tc match at type_off in {{0,8,16,24,32}}",
-                             off, base_ptr));
-            }
-        }
-    }
+    // parameters at +0x30
+    let params_a = cache::read_u64(method_a as usize + 0x30).unwrap_or(0);
+    log(&format!("  parameters +0x30   base={:#x}", params_a));
+    // param[0] type at +0x00
+    let p0_a = cache::read_u64(params_a as usize).unwrap_or(0);
+    log(&format!("  param[0]@+0x00     {}", classify("type", p0_a, anchor_a.param_tc, anchor_a.name)));
 
-    if param_base_candidates.is_empty() {
-        log("no parameters base found; aborting");
+    // flags at +0x4C
+    let flags_a = cache::read_u32(method_a as usize + 0x4C).unwrap_or(0);
+    log(&format!("  flags +0x4C        {:#x}  (static_bit={})", flags_a, (flags_a & 0x10) != 0));
+
+    // ── Phase B — distinct-type anchor for stride ────────────────────────
+    log("--- phase B: PadLeft(Int32, Char) for stride disambiguation ---");
+    let string_klass = api::find_class("System::String");
+    if string_klass == 0 {
+        log("phase B: System::String not found, aborting stride probe");
         return;
     }
+    let pad_method = api::find_method(string_klass, "PadLeft", 2);
+    if pad_method == 0 {
+        log("phase B: String::PadLeft(2) not found, aborting stride probe");
+        return;
+    }
+    log(&format!("phase B anchor: String::PadLeft(2) @ {:#x}", pad_method));
 
-    // ── 3. Raw hex dump around the first matching base — 0x40 bytes ────
-    let (best_off, best_base) = param_base_candidates[0];
-    log(&format!("--- raw hex dump of parameters base @ {:#x} (from method+{:#04x}) ---",
-                 best_base, best_off));
-    let base_u = best_base as usize;
+    let params_b = cache::read_u64(pad_method as usize + 0x30).unwrap_or(0) as usize;
+    log(&format!("  parameters base    {:#x}", params_b));
+
+    // Raw hex dump of first 0x40 bytes
+    log("  raw dump:");
     for row in 0..8 {
-        let start = base_u + row * 8;
-        let v = cache::read_u64(start).unwrap_or(0);
-        log(&format!("  +{:#04x}  {:#018x}", row * 8, v));
+        let v = cache::read_u64(params_b + row * 8).unwrap_or(0);
+        log(&format!("    +{:#04x}  {:#018x}", row * 8, v));
     }
 
-    // ── 4. For the best base, deref each 8-byte slot as a possible
-    //       Il2CppType ptr and check tc ────────────────────────────────
-    log("--- type-tc check at each 8-byte slot in the first 0x40 bytes ---");
-    for row in 0..8 {
-        let off = row * 8;
-        let p = cache::read_u64(base_u + off).unwrap_or(0);
-        if p < 0x10000 { continue; }
-        let tc = read_tc(p as usize);
-        let marker = if tc == anchor.param_tc { " ← param_tc MATCH" } else { "" };
-        log(&format!("  slot +{:#04x}  ptr={:#x} tc={:#04x}{}", off, p, tc, marker));
+    // Check param[0].type (must be I4 = 0x08)
+    let p0_b = cache::read_u64(params_b).unwrap_or(0);
+    log(&format!("  param[0]@+0x00     {}", classify("type", p0_b, IL2CPP_TYPE_I4, "I4 (Int32)")));
+
+    // For each candidate stride, read param[1] type ptr and check for CHAR (0x03).
+    log("  param[1] candidates by stride:");
+    for stride in [0x08usize, 0x10, 0x18, 0x20, 0x28] {
+        let p1 = cache::read_u64(params_b + stride).unwrap_or(0);
+        log(&format!("    stride={:#04x}   {}",
+                     stride, classify("type", p1, IL2CPP_TYPE_CHAR, "CHAR")));
     }
 
-    // ── 5. flags at +0x4C ──────────────────────────────────────────────
-    let flags = cache::read_u32(method as usize + 0x4C).unwrap_or(0);
-    log(&format!("--- flags @ +0x4C = {:#x}  (static_bit (0x10) = {})  ---",
-                 flags, (flags & 0x10) != 0));
-
-    log("=== end METHODINFO PROBE v3 ===");
+    log("=== end METHODINFO PROBE v4 ===");
 }
