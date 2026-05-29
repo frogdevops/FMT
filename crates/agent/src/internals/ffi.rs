@@ -309,15 +309,26 @@ unsafe fn resolve_scrambled_exports(
     let thread_attach_opt: Option<&ExportedFunc> = None;
     let _ = is_throw_stub; // silence dead-code lint when we don't probe a name
 
-    // 13. runtime_invoke — large body. PW-derived prologue pattern (stable across v24
-    //     within PW; may need re-fingerprinting for other obfuscated games).
-    //     Typical opening: `sub rsp, X; mov [rsp+0x20], r9; mov r10, rdx`.
+    // 13. runtime_invoke — large body. Cross-validated prologue (20 bytes):
+    //     confirmed byte-for-byte against Highrise's `il2cpp_runtime_invoke`
+    //     (un-obfuscated by symbol) AND PW's mangled `agprGwLUTkY` export.
+    //     No wildcards — the spill sequence is stable across both builds.
     //     If the pattern doesn't match, the entire sig-scan resolver returns None
     //     and invoke stays disabled — non-fatal for the rest of the agent.
-    let pat_runtime_invoke: [u16; 12] = [
-        0x48, 0x83, 0xEC, 0x100,        // sub rsp, X
-        0x4C, 0x89, 0x4C, 0x24, 0x20,   // mov [rsp+0x20], r9   (the exc out-param)
-        0x49, 0x89, 0xD2,                // mov r10, rdx           (this ptr scratch)
+    // Confirmed prologue (20 bytes): cross-validated against Highrise's
+    // `il2cpp_runtime_invoke` (un-obfuscated by symbol) and PW's `agprGwLUTkY`
+    // (obfuscated; first 32 bytes byte-for-byte identical to Highrise).
+    //   mov [rsp+0x08], rbx
+    //   mov [rsp+0x10], rsi
+    //   mov [rsp+0x20], r9    ; save exc out-param
+    //   push rdi
+    //   sub rsp, 0x30
+    let pat_runtime_invoke: [u16; 20] = [
+        0x48, 0x89, 0x5C, 0x24, 0x08,
+        0x48, 0x89, 0x74, 0x24, 0x10,
+        0x4C, 0x89, 0x4C, 0x24, 0x20,
+        0x57,
+        0x48, 0x83, 0xEC, 0x30,
     ];
     let runtime_invoke_func = resolved_exports.iter().find(|exp| {
         matches_pattern(exp.code_slice, &pat_runtime_invoke)

@@ -34,6 +34,7 @@ use crate::internals::ctx;
 pub struct MethodSignature {
     pub param_types:  Vec<ValType>,
     pub return_type:  ValType,
+    pub return_tc:    u8,         // raw IL2CPP_TYPE_* code; distinguishes value vs reference types
     pub is_static:    bool,
 }
 
@@ -70,7 +71,7 @@ pub fn read_signature(method: MethodPtr) -> Result<MethodSignature, InvokeError>
     let ret_tc = ((ret_chunk >> c.cfg.discrim_shift) & 0xFF) as u8;
     let return_type = valtype_from_tc(ret_tc).unwrap_or(ValType::U64);
 
-    Ok(MethodSignature { param_types, return_type, is_static })
+    Ok(MethodSignature { param_types, return_type, return_tc: ret_tc, is_static })
 }
 
 /// Stable storage for one invoke call's args. Slabs are owned Vec<u8>; ptrs into
@@ -150,12 +151,23 @@ impl InvokeContext {
 /// Unpack a return value pointer into an InvokeArg. First cut: primitives only.
 /// Returns InvokeArg::Null for void-typed returns (signature says Void/U64 with
 /// no slot, caller can tag).
-pub fn unpack_return(return_type: ValType, ret_ptr: *mut c_void) -> Result<InvokeArg, InvokeError> {
+pub fn unpack_return(return_type: ValType, return_tc: u8, ret_ptr: *mut c_void) -> Result<InvokeArg, InvokeError> {
     if ret_ptr.is_null() {
         return Ok(InvokeArg::Null);
     }
+    // il2cpp_runtime_invoke returns VALUE TYPES as a boxed Il2CppObject (the value
+    // sits at offset 0x10 past the klass + monitor header). REFERENCE TYPES are
+    // returned as the Il2CppObject* directly — no second boxing.
+    //   value types:  tc in 0x02..=0x0D (primitives) or 0x11 (VALUETYPE struct)
+    //   reference:    tc in 0x0E (string), 0x12 (class), 0x14 (array), etc.
+    let is_value_type = matches!(return_tc, 0x02..=0x0D | 0x11);
+    let value_ptr = if is_value_type {
+        (ret_ptr as usize) + 0x10  // skip Il2CppObject header
+    } else {
+        ret_ptr as usize
+    };
     let width = return_type.fixed_width().unwrap_or(8);
-    let bytes = unsafe { std::slice::from_raw_parts(ret_ptr as *const u8, width) };
+    let bytes = unsafe { std::slice::from_raw_parts(value_ptr as *const u8, width) };
     let v = Value::decode(return_type, bytes).ok_or(
         InvokeError::InternalFailure("return decode failed")
     )?;
@@ -234,5 +246,5 @@ pub fn invoke_method(
     }
 
     // 8. Unpack return value.
-    unpack_return(sig.return_type, ret_ptr)
+    unpack_return(sig.return_type, sig.return_tc, ret_ptr)
 }
