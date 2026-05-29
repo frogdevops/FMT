@@ -103,14 +103,30 @@ pub struct Il2CppConfig {
     pub param_info_type_off: usize,
 }
 
+/// Minimum number of anchors required for a probe to OVERRIDE the fallback constant.
+/// Below this threshold the probe outcome is logged but the field is kept at the
+/// verified-correct prior (v24 baseline).  Two anchors (e.g. Math.Pow +
+/// String.PadLeft) can produce a spurious perfect-score on a sparse/mis-loaded
+/// table; three forces at least minimal triangulation.
+const MIN_OVERRIDE_ANCHORS: u32 = 3;
+
 /// Apply a probe outcome to a config field. The fallback constant is a
 /// VERIFIED-CORRECT prior; a probe may only OVERRIDE it when it produced a
-/// winning offset. Every override that DIFFERS from the prior is logged loudly
-/// BEFORE it is applied, so the calibration trail makes clear when (and why)
-/// the live runtime diverged from the baseline. When the probe fell back, the
-/// field is left at its prior value (the working v24 behavior — the floor).
+/// winning offset AND gathered enough independent anchors (≥ MIN_OVERRIDE_ANCHORS).
+/// Every override that DIFFERS from the prior is logged loudly BEFORE it is
+/// applied, so the calibration trail makes clear when (and why) the live runtime
+/// diverged from the baseline. When the probe fell back, or when the anchor count
+/// is below the threshold, the field is left at its prior value (the floor).
 fn apply_offset(field: &mut usize, outcome: &crate::internals::calibration::ProbeOutcome) {
     if let Some(off) = outcome.winning_offset {
+        if outcome.anchor_count < MIN_OVERRIDE_ANCHORS {
+            // Too few anchors — log as weak and keep the verified-correct fallback.
+            crate::paths::log(&format!(
+                "⚠ PROBE WEAK: {} probed={:#x} (only {}/{}) — keeping fallback {:#x}",
+                outcome.field_name, off,
+                outcome.match_count, outcome.anchor_count, *field));
+            return;
+        }
         if off != *field {
             crate::paths::log(&format!(
                 "⚠ PROBE OVERRIDE: {} fallback={:#x} → probed={:#x} (match {}/{})",
@@ -217,12 +233,19 @@ impl Il2CppConfig {
         {
             let prev = cfg.discrim_shift;
             if let Some(off) = td_shift.winning_offset {
-                if off as u8 != prev {
+                if td_shift.anchor_count < MIN_OVERRIDE_ANCHORS {
                     crate::paths::log(&format!(
-                        "⚠ PROBE OVERRIDE: {} fallback={:#x} → probed={:#x} (match {}/{})",
-                        td_shift.field_name, prev, off, td_shift.match_count, td_shift.anchor_count));
+                        "⚠ PROBE WEAK: {} probed={:#x} (only {}/{}) — keeping fallback {:#x}",
+                        td_shift.field_name, off,
+                        td_shift.match_count, td_shift.anchor_count, prev));
+                } else {
+                    if off as u8 != prev {
+                        crate::paths::log(&format!(
+                            "⚠ PROBE OVERRIDE: {} fallback={:#x} → probed={:#x} (match {}/{})",
+                            td_shift.field_name, prev, off, td_shift.match_count, td_shift.anchor_count));
+                    }
+                    cfg.discrim_shift = off as u8;
                 }
-                cfg.discrim_shift = off as u8;
             }
         }
         let phase3 = vec![td_read, td_shift];

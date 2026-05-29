@@ -11,8 +11,13 @@ const ANCHOR_COUNT: usize = 50;
 
 /// Sample up to `n` non-null klass pointers from the class table, each paired
 /// with the FFI-derived "expected" value via `extract_truth`.
+///
+/// Uses stride-1 (sequential scan) rather than stride-N so that sparse tables
+/// (e.g. PW fill ratio ~21%) still accumulate the full `n` anchors instead of
+/// visiting only ~n slot positions and hitting mostly nulls.  On dense tables
+/// the first `n` real klasses are found well before the end of the table.
 fn sample_klass_anchors<T: Clone>(
-    api: &Il2CppApi,
+    _api: &Il2CppApi,
     map: &RegionMap,
     table_base: usize,
     table_count: usize,
@@ -21,24 +26,23 @@ fn sample_klass_anchors<T: Clone>(
     extract_truth: impl Fn(usize) -> Option<T>,
 ) -> Vec<(usize, T)> {
     let mut out: Vec<(usize, T)> = Vec::with_capacity(n);
-    let stride = if table_count > n { table_count / n } else { 1 };
-    let mut i = 0usize;
-    while i < table_count && out.len() < n {
+    // Skip past nulls/garbage; stride 1 with sparse-aware progress. We sample
+    // up to n REAL klasses (not n slot positions) — the old strided form
+    // dropped to ~10 anchors on sparse tables (PW: 3991/18515 slots filled).
+    for i in 0..table_count {
+        if out.len() >= n { break; }
         let slot = table_base.wrapping_add(i * class_table_step);
-        if let Some(klass) = map.read_u64(slot) {
-            if klass != 0 {
-                let k = klass as usize;
-                // Gate FFI on potentially-garbage class-table slots: obfuscated
-                // builds hold non-klass values in non-null slots, and calling
-                // FFI (extract_truth) on those crashes the process.
-                if cache::is_klass_shape(k) {
-                    if let Some(truth) = extract_truth(k) {
-                        out.push((k, truth));
-                    }
-                }
-            }
+        let klass = match map.read_u64(slot) {
+            Some(k) if k != 0 => k as usize,
+            _ => continue,
+        };
+        // Gate FFI on potentially-garbage class-table slots: obfuscated
+        // builds hold non-klass values in non-null slots, and calling
+        // FFI (extract_truth) on those crashes the process.
+        if !cache::is_klass_shape(klass) { continue; }
+        if let Some(truth) = extract_truth(klass) {
+            out.push((klass, truth));
         }
-        i += stride;
     }
     crate::paths::log(&format!("  Phase1: sample_klass_anchors gathered {} anchors", out.len()));
     out
@@ -171,13 +175,27 @@ pub fn probe_klass_fields(
     let candidates = vec![0x70usize, 0x78, 0x80, 0x88, 0x90];
     let anchors = sample_klass_anchors(api, map, table_base, table_count, class_table_step, ANCHOR_COUNT,
         |k| {
-            // Only sample classes the FFI says have ≥1 field.
+            // Only sample classes that have ≥1 field.
             if let Some(get_fields) = api.class_get_fields {
+                // FFI path: fast check via il2cpp ABI.
                 let mut iter: *mut std::ffi::c_void = std::ptr::null_mut();
                 let fi = unsafe { get_fields(k as *mut Il2CppClass, &mut iter) };
                 if fi.is_null() { return None; }
                 Some(())
-            } else { None }
+            } else {
+                // Memory-walk fallback for builds where class_get_fields was not
+                // resolved (e.g. obfuscated/stripped il2cpp like Pixel Worlds).
+                // Peek klass + fallback.klass_fields → FieldInfo array; if the
+                // first element's name pointer resolves to a non-empty cstr the
+                // class has at least one field.
+                let fallback = crate::internals::config::Il2CppConfig::fallback_constants();
+                let arr = map.read_u64(k + fallback.klass_fields)? as usize;
+                if arr == 0 { return None; }
+                let name_ptr = map.read_u64(arr)? as usize;
+                if name_ptr == 0 { return None; }
+                let name = map.read_name(name_ptr)?;
+                if name.is_empty() { None } else { Some(()) }
+            }
         });
     let total = anchors.len() as u32;
     let extract = |k: &usize, off: usize| -> Option<()> {
