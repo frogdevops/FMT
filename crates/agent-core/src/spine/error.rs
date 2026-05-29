@@ -25,3 +25,30 @@ impl From<MemError> for i32 {
         }
     }
 }
+
+use crate::mem_value::ValType;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvokeError {
+    NotFound,
+    ArgCountMismatch { expected: u8, got: u8 },
+    ArgTypeMismatch { idx: u8, expected: ValType, got: ValType },
+    NullInstance,
+    MarshalFailed { idx: u8, reason: &'static str },
+    ManagedException(String),
+    InternalFailure(&'static str),
+}
+
+impl From<InvokeError> for i32 {
+    fn from(e: InvokeError) -> i32 {
+        match e {
+            InvokeError::NotFound               => -100,
+            InvokeError::ArgCountMismatch { .. } => -101,
+            InvokeError::ArgTypeMismatch { .. }  => -102,
+            InvokeError::NullInstance            => -103,
+            InvokeError::MarshalFailed { .. }    => -104,
+            InvokeError::ManagedException(_)     => -105,
+            InvokeError::InternalFailure(_)      => -106,
+        }
+    }
+}
