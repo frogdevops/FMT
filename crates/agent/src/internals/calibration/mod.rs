@@ -5,6 +5,7 @@
 //! lives in config.rs and calls the phase functions in dependency order.
 
 pub mod candidates_local;  // thin wrapper around agent_core::calibration for ergonomics
+pub mod anchors;           // CTX-FREE local_find_class / local_find_method shared by all phases
 pub mod stability;
 pub mod klass_layout;
 pub mod method_layout;

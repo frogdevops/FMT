@@ -1,19 +1,27 @@
 //! Phase 3: probe the il2cpp type discriminator extraction recipe.
 
 use crate::external::region_map::RegionMap;
-use crate::internals::api as iapi;
+use crate::internals::calibration::anchors::local_find_class;
+#[allow(unused_imports)]
 use crate::internals::calibration::candidates_local::pick_offset_by_consensus;
 use crate::internals::calibration::ProbeOutcome;
+use crate::internals::ffi::Il2CppApi;
 
 const MIN_RATIO: f32 = 0.90;
 
 /// Build a (klass-ptr, expected-tc) anchor list from known il2cpp types.
-fn type_anchors() -> Vec<(usize, u8)> {
+/// CTX-FREE — walks the live table via `api` (ctx isn't init'd during probe()).
+fn type_anchors(
+    api: &Il2CppApi,
+    table_base: usize,
+    table_count: usize,
+    class_table_step: usize,
+) -> Vec<(usize, u8)> {
     [("System::Int32", 0x08u8), ("System::String", 0x0E), ("System::Object", 0x1C),
      ("System::Single", 0x0C), ("System::Double", 0x0D)]
         .iter().filter_map(|(name, tc)| {
-            let k = iapi::find_class(name);
-            if k != 0 { Some((k as usize, *tc)) } else { None }
+            let k = local_find_class(api, table_base, table_count, class_table_step, name);
+            if k != 0 { Some((k, *tc)) } else { None }
         }).collect()
 }
 
@@ -26,10 +34,14 @@ fn type_anchors() -> Vec<(usize, u8)> {
 /// + N for N in [0x00, 0x08]; and shift by [0, 8, 16, 24]. The (offset, shift)
 /// pair where >=90% of anchors yield their expected tc wins.
 pub fn probe_type_discrim(
+    api: &Il2CppApi,
     map: &RegionMap,
+    table_base: usize,
+    table_count: usize,
+    class_table_step: usize,
     klass_type_def_off: usize,
 ) -> (ProbeOutcome, ProbeOutcome) {
-    let anchors = type_anchors();
+    let anchors = type_anchors(api, table_base, table_count, class_table_step);
     let total = anchors.len() as u32;
 
     let read_candidates: Vec<usize> = vec![0x00, 0x08];

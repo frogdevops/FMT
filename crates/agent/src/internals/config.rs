@@ -103,6 +103,23 @@ pub struct Il2CppConfig {
     pub param_info_type_off: usize,
 }
 
+/// Apply a probe outcome to a config field. The fallback constant is a
+/// VERIFIED-CORRECT prior; a probe may only OVERRIDE it when it produced a
+/// winning offset. Every override that DIFFERS from the prior is logged loudly
+/// BEFORE it is applied, so the calibration trail makes clear when (and why)
+/// the live runtime diverged from the baseline. When the probe fell back, the
+/// field is left at its prior value (the working v24 behavior — the floor).
+fn apply_offset(field: &mut usize, outcome: &crate::internals::calibration::ProbeOutcome) {
+    if let Some(off) = outcome.winning_offset {
+        if off != *field {
+            crate::paths::log(&format!(
+                "⚠ PROBE OVERRIDE: {} fallback={:#x} → probed={:#x} (match {}/{})",
+                outcome.field_name, *field, off, outcome.match_count, outcome.anchor_count));
+        }
+        *field = off;
+    }
+}
+
 impl Il2CppConfig {
     // ── Baseline constants ───────────────────────────────────────
 
@@ -161,58 +178,71 @@ impl Il2CppConfig {
         let fl = klass_layout::probe_klass_fields(api, map, table_base, table_count, cfg.class_table_step);
         let me = klass_layout::probe_klass_methods(api, map, table_base, table_count, cfg.class_table_step);
         let sf = klass_layout::probe_klass_static_fields(api, map, table_base, table_count, cfg.class_table_step);
-        let (vt, vt_bit) = klass_layout::probe_klass_valuetype(api, map);
+        let (vt, vt_bit) = klass_layout::probe_klass_valuetype(api, map, table_base, table_count, cfg.class_table_step);
         crate::paths::log("probe: Phase 1 (klass) EXIT");
-        cfg.klass_namespace      = n.winning_offset.unwrap_or(cfg.klass_namespace);
-        cfg.klass_type_def       = td.winning_offset.unwrap_or(cfg.klass_type_def);
-        cfg.klass_fields         = fl.winning_offset.unwrap_or(cfg.klass_fields);
-        cfg.klass_methods        = me.winning_offset.unwrap_or(cfg.klass_methods);
-        cfg.klass_static_fields  = sf.winning_offset.unwrap_or(cfg.klass_static_fields);
-        cfg.klass_valuetype_off  = vt.winning_offset.unwrap_or(cfg.klass_valuetype_off);
+        apply_offset(&mut cfg.klass_namespace, &n);
+        apply_offset(&mut cfg.klass_type_def, &td);
+        apply_offset(&mut cfg.klass_fields, &fl);
+        apply_offset(&mut cfg.klass_methods, &me);
+        apply_offset(&mut cfg.klass_static_fields, &sf);
+        apply_offset(&mut cfg.klass_valuetype_off, &vt);
         if let Some(b) = vt_bit { cfg.klass_valuetype_bit = b; }
         let phase1 = vec![n, td, fl, me, sf, vt];
 
         // Phase 2
         crate::paths::log("probe: Phase 2 (method) ENTER");
-        let mp = method_layout::probe_method_pointer_off(map);
-        let mn = method_layout::probe_method_name_off(map);
-        let mk = method_layout::probe_method_klass_off(map);
-        let mf = method_layout::probe_method_flags_off(map);
-        let mpars = method_layout::probe_method_parameters_off(map);
-        let mret = method_layout::probe_method_return_type_off(map);
-        let mpc = method_layout::probe_method_param_count_off(map);
-        cfg.method_pointer_off      = mp.winning_offset.unwrap_or(cfg.method_pointer_off);
-        cfg.method_name_off         = mn.winning_offset.unwrap_or(cfg.method_name_off);
-        cfg.method_klass_off        = mk.winning_offset.unwrap_or(cfg.method_klass_off);
-        cfg.method_flags_off        = mf.winning_offset.unwrap_or(cfg.method_flags_off);
-        cfg.method_parameters_off   = mpars.winning_offset.unwrap_or(cfg.method_parameters_off);
-        cfg.method_return_type_off  = mret.winning_offset.unwrap_or(cfg.method_return_type_off);
-        cfg.method_param_count_off  = mpc.winning_offset.unwrap_or(cfg.method_param_count_off);
+        let cts = cfg.class_table_step;
+        let mp = method_layout::probe_method_pointer_off(api, map, table_base, table_count, cts);
+        let mn = method_layout::probe_method_name_off(api, map, table_base, table_count, cts);
+        let mk = method_layout::probe_method_klass_off(api, map, table_base, table_count, cts);
+        let mf = method_layout::probe_method_flags_off(api, map, table_base, table_count, cts);
+        let mpars = method_layout::probe_method_parameters_off(api, map, table_base, table_count, cts);
+        let mret = method_layout::probe_method_return_type_off(api, map, table_base, table_count, cts);
+        let mpc = method_layout::probe_method_param_count_off(api, map, table_base, table_count, cts);
+        apply_offset(&mut cfg.method_pointer_off, &mp);
+        apply_offset(&mut cfg.method_name_off, &mn);
+        apply_offset(&mut cfg.method_klass_off, &mk);
+        apply_offset(&mut cfg.method_flags_off, &mf);
+        apply_offset(&mut cfg.method_parameters_off, &mpars);
+        apply_offset(&mut cfg.method_return_type_off, &mret);
+        apply_offset(&mut cfg.method_param_count_off, &mpc);
         let phase2 = vec![mp, mn, mk, mf, mpars, mret, mpc];
         crate::paths::log("probe: Phase 2 (method) EXIT");
 
         // Phase 3
         crate::paths::log("probe: Phase 3 (type_discrim) ENTER");
-        let (td_read, td_shift) = type_discrim::probe_type_discrim(map, cfg.klass_type_def);
-        cfg.il2cpp_type_discrim_read_at = td_read.winning_offset.unwrap_or(cfg.il2cpp_type_discrim_read_at);
-        cfg.discrim_shift               = td_shift.winning_offset.unwrap_or(cfg.discrim_shift as usize) as u8;
+        let (td_read, td_shift) = type_discrim::probe_type_discrim(
+            api, map, table_base, table_count, cfg.class_table_step, cfg.klass_type_def);
+        apply_offset(&mut cfg.il2cpp_type_discrim_read_at, &td_read);
+        {
+            let prev = cfg.discrim_shift;
+            if let Some(off) = td_shift.winning_offset {
+                if off as u8 != prev {
+                    crate::paths::log(&format!(
+                        "⚠ PROBE OVERRIDE: {} fallback={:#x} → probed={:#x} (match {}/{})",
+                        td_shift.field_name, prev, off, td_shift.match_count, td_shift.anchor_count));
+                }
+                cfg.discrim_shift = off as u8;
+            }
+        }
         let phase3 = vec![td_read, td_shift];
         crate::paths::log("probe: Phase 3 (type_discrim) EXIT");
 
         // Phase 4
         crate::paths::log("probe: Phase 4 (field_param) ENTER");
         let (pi_size, pi_type) = field_param_layout::probe_param_info(
-            map, cfg.klass_type_def, cfg.il2cpp_type_discrim_read_at,
+            api, map, table_base, table_count, cfg.class_table_step,
+            cfg.klass_type_def, cfg.il2cpp_type_discrim_read_at,
             cfg.discrim_shift as usize, cfg.method_parameters_off,
         );
-        cfg.param_info_size     = pi_size.winning_offset.unwrap_or(cfg.param_info_size);
-        cfg.param_info_type_off = pi_type.winning_offset.unwrap_or(cfg.param_info_type_off);
+        apply_offset(&mut cfg.param_info_size, &pi_size);
+        apply_offset(&mut cfg.param_info_type_off, &pi_type);
         let phase4 = vec![pi_size, pi_type];
         crate::paths::log("probe: Phase 4 (field_param) EXIT");
 
         // Phase 5
         crate::paths::log("probe: Phase 5 (ffi_verify) ENTER");
-        let phase5 = ffi_verify::run_verification(api);
+        let phase5 = ffi_verify::run_verification(api, table_base, table_count, cfg.class_table_step);
         crate::paths::log("probe: Phase 5 (ffi_verify) EXIT");
 
         // Phase 6

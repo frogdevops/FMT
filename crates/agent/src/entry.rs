@@ -100,13 +100,13 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         Il2CppConfig::probe(&map, &api, table_base, table_count, phase0);
     calibration_report.log();
 
-    // Phase 1 (klass layout) failure → terminate. The agent loads but does
-    // nothing useful — operator must inspect the calibration block.
-    use crate::internals::calibration::klass_layout::any_critical_failed;
-    if any_critical_failed(&calibration_report.phase1_klass) {
-        log("CALIBRATION FATAL: Phase 1 klass layout probe failed. Terminating worker.");
-        return 0;
-    }
+    // Bedrock B-1 (corrected): a probe falling back is NOT fatal. The fallback
+    // IS the verified-correct v24 prior that worked before B-1, so terminating
+    // on fallback would make the agent strictly worse. The floor is always the
+    // working v24 behavior; the probes only OVERRIDE the prior when a
+    // discriminating, high-confidence probe proves a different offset (each such
+    // override is logged loudly in the calibration report above). We proceed
+    // with whatever probe/fallback produced.
 
     let type_maps = build_type_maps(table_base, table_count, &api, &map, &cfg);
 

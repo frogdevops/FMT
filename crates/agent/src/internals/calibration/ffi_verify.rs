@@ -1,7 +1,7 @@
 //! Phase 5: call each resolved FFI export with a known input and verify
 //! the return. Mismatches cause loud diagnostic logs.
 
-use crate::internals::api as iapi;
+use crate::internals::calibration::anchors::local_find_class;
 use crate::internals::ffi::{cstr_to_string, Il2CppApi, Il2CppClass};
 
 #[derive(Debug)]
@@ -58,9 +58,16 @@ fn line(name: &str, v: &Verified) -> String {
 }
 
 /// Run verification using a known klass for ground truth (e.g. System::Int32).
-pub fn run_verification(api: &Il2CppApi) -> VerificationReport {
-    let int32 = iapi::find_class("System::Int32") as *mut Il2CppClass;
-    let player = iapi::find_class("Player") as *mut Il2CppClass;  // best-effort
+/// CTX-FREE — resolves anchors via the live-table walk, since ctx::init runs
+/// AFTER probe() (so iapi::find_class would return 0 here).
+pub fn run_verification(
+    api: &Il2CppApi,
+    table_base: usize,
+    table_count: usize,
+    class_table_step: usize,
+) -> VerificationReport {
+    let int32 = local_find_class(api, table_base, table_count, class_table_step, "System::Int32") as *mut Il2CppClass;
+    let player = local_find_class(api, table_base, table_count, class_table_step, "Player") as *mut Il2CppClass;  // best-effort
 
     let domain_get = unsafe {
         let p = (api.domain_get)();

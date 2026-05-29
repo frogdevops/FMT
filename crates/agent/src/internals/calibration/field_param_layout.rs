@@ -1,9 +1,12 @@
 //! Phase 4: probe FieldInfo + ParameterInfo strides and per-element offsets.
 
 use crate::external::region_map::RegionMap;
-use crate::internals::api as iapi;
+use crate::internals::calibration::anchors::{local_find_class, local_find_method};
+#[allow(unused_imports)]
 use crate::internals::calibration::candidates_local::pick_offset_by_consensus;
 use crate::internals::calibration::ProbeOutcome;
+use crate::internals::config::Il2CppConfig;
+use crate::internals::ffi::Il2CppApi;
 
 const MIN_RATIO: f32 = 0.90;
 
@@ -12,14 +15,19 @@ const MIN_RATIO: f32 = 0.90;
 /// We test (stride, type_off) pairs and accept the one where both
 /// param[0] and param[1] yield expected tcs.
 pub fn probe_param_info(
+    api: &Il2CppApi,
     map: &RegionMap,
+    table_base: usize,
+    table_count: usize,
+    class_table_step: usize,
     klass_type_def_off: usize,
     discrim_read_at: usize,
     discrim_shift: usize,
     method_parameters_off: usize,
 ) -> (ProbeOutcome, ProbeOutcome) {
-    let string = iapi::find_class("System::String");
-    let padleft = if string != 0 { iapi::find_method(string, "PadLeft", 2) } else { 0 };
+    let cfg = Il2CppConfig::fallback_constants();
+    let string = local_find_class(api, table_base, table_count, class_table_step, "System::String");
+    let padleft = if string != 0 { local_find_method(&cfg, string, "PadLeft", 2) } else { 0 };
     if padleft == 0 {
         return (
             ProbeOutcome {
