@@ -19,11 +19,16 @@ use core::arch::global_asm;
 global_asm!(
     ".global call_trampoline_with_regargs",
     "call_trampoline_with_regargs:",
-    // ── Prologue: save callee-saved registers we use ──────────────
-    "  push rbx",                       // we'll stash &RegArgs here
-    "  push rbp",
-    "  mov  rbp, rsp",
-    "  sub  rsp, 32",                   // shadow space for trampoline call
+    // ── Prologue: save callee-saved regs + align stack ────────────
+    //  Entry rsp ≡ 8 mod 16 (standard Win64 callee entry).
+    //  push rbx → 0 mod 16.  sub rsp, 32 (multiple of 16) → 0 mod 16.
+    //  Before `call rax` rsp must be 0 mod 16 so callee sees 8 mod 16
+    //  (required for SSE 16-byte aligned stack ops in Pow's body).
+    //
+    //  We do NOT push rbp / set up a frame pointer — it would shift
+    //  parity by 8 and misalign the trampoline call.
+    "  push rbx",                       // stash &RegArgs survives across call
+    "  sub  rsp, 32",                   // shadow space + alignment
     // ── Stash inputs ──────────────────────────────────────────────
     "  mov  rax, rcx",                  // rax = trampoline ptr (will call via rax)
     "  mov  rbx, rdx",                  // rbx = &RegArgs (survives the call)
@@ -46,7 +51,6 @@ global_asm!(
     "  movsd qword ptr [rbx + 88], xmm0",
     // ── Epilogue ─────────────────────────────────────────────────
     "  add rsp, 32",
-    "  pop rbp",
     "  pop rbx",
     "  ret",
 );

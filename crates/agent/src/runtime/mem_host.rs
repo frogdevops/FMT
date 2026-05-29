@@ -139,6 +139,78 @@ fn host_find_method(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, na
     crate::internals::api::find_method(klass as u64, &String::from_utf8_lossy(&name), argc.max(0) as u32) as i64
 }
 
+fn host_install_hook(
+    _caller: wasmi::Caller<'_, HostState>,
+    method_ptr: i64,
+    handler_funcref_table_idx: i32,
+) -> i64 {
+    use agent_core::spine::MethodPtr;
+    let method = MethodPtr::from_raw(method_ptr as u64);
+    match crate::internals::hook_runtime::api::install_hook(method, handler_funcref_table_idx as u64) {
+        Ok(handle) => handle.as_u64() as i64,
+        Err(e)     => i32::from(e) as i64,   // negative codes -200..-205 sign-extend
+    }
+}
+
+fn host_remove_hook(
+    _caller: wasmi::Caller<'_, HostState>,
+    handle: i64,
+) -> i32 {
+    use agent_core::spine::HookHandle;
+    match crate::internals::hook_runtime::api::remove_hook(HookHandle::from_raw(handle as u64)) {
+        Ok(())  => 0,
+        Err(e)  => i32::from(e),
+    }
+}
+
+fn host_hook_arg(mut caller: wasmi::Caller<'_, HostState>, arg_idx: i32, out_buf: i32, out_cap: i32) -> i32 {
+    match crate::internals::hook_runtime::api::hook_arg_read(arg_idx as usize) {
+        Ok(bytes) => {
+            if bytes.len() > out_cap as usize { return -4; }
+            let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) { Some(m) => m, None => return -3 };
+            if mem.write(&mut caller, out_buf as usize, &bytes).is_err() { return -1; }
+            bytes.len() as i32
+        }
+        Err(e) => i32::from(e),
+    }
+}
+
+fn host_hook_set_arg(mut caller: wasmi::Caller<'_, HostState>, arg_idx: i32, val_buf: i32, val_len: i32) -> i32 {
+    let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) { Some(m) => m, None => return -3 };
+    let mut buf = vec![0u8; val_len as usize];
+    if mem.read(&caller, val_buf as usize, &mut buf).is_err() { return -1; }
+    match crate::internals::hook_runtime::api::hook_arg_write(arg_idx as usize, &buf) {
+        Ok(()) => 0,
+        Err(e) => i32::from(e),
+    }
+}
+
+fn host_hook_this(_caller: wasmi::Caller<'_, HostState>) -> i64 {
+    crate::internals::hook_runtime::api::hook_this_get() as i64
+}
+
+fn host_call_original(mut caller: wasmi::Caller<'_, HostState>, out_buf: i32, out_cap: i32) -> i32 {
+    match crate::internals::hook_runtime::api::call_original_now() {
+        Ok(bytes) => {
+            if bytes.len() > out_cap as usize { return -4; }
+            let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) { Some(m) => m, None => return -3 };
+            if mem.write(&mut caller, out_buf as usize, &bytes).is_err() { return -1; }
+            0
+        }
+        Err(e) => i32::from(e),
+    }
+}
+
+fn host_hook_set_return(mut caller: wasmi::Caller<'_, HostState>, val_buf: i32, val_len: i32) -> i32 {
+    let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) { Some(m) => m, None => return -3 };
+    let mut buf = vec![0u8; val_len as usize];
+    if mem.read(&caller, val_buf as usize, &mut buf).is_err() { return -1; }
+    match crate::internals::hook_runtime::api::hook_set_return(&buf) {
+        Ok(()) => 0,
+        Err(e) => i32::from(e),
+    }
+}
+
 fn host_invoke(mut caller: Caller<'_, HostState>, method_ptr: i64, instance_ptr: i64, args_buf: i32, args_len: i32, out_buf: i32, out_cap: i32) -> i32 {
     use agent_core::spine::{Instance, InvokeArg, MethodPtr};
 
@@ -201,6 +273,13 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
     linker.func_wrap("il2cpp", "static_field", host_static_field).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "find_method", host_find_method).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "invoke", host_invoke).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "install_hook", host_install_hook).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "remove_hook", host_remove_hook).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "hook_arg",        host_hook_arg).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "hook_set_arg",    host_hook_set_arg).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "hook_this",       host_hook_this).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "call_original",   host_call_original).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "hook_set_return", host_hook_set_return).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     if write_granted {
         linker.func_wrap("mem", "write", host_write).map_err(|e| WasmError::Instantiate(e.to_string()))?;
         linker.func_wrap("mem", "write_if", host_write_if).map_err(|e| WasmError::Instantiate(e.to_string()))?;

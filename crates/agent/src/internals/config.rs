@@ -85,6 +85,11 @@ pub struct Il2CppConfig {
     pub klass_valuetype_bit: u8,
 
     // ── MethodInfo / ParameterInfo ───────────────────────────────
+    /// Offset of `methodPointer` (the actual native function code pointer)
+    /// within MethodInfo.  Standard il2cpp puts this at +0x00 but Frog's
+    /// probe confirmed a +0x08 shift for both v24 (Pixel Worlds) and v30
+    /// (Highrise) — so we always patch +0x08, never the struct base.
+    pub method_pointer_off: usize,
     /// Offset of the `return_type` ptr (→ Il2CppType*) within MethodInfo.
     /// Derived structurally via diagnostics::methodinfo_probe.
     pub method_return_type_off: usize,
@@ -158,6 +163,7 @@ impl Il2CppConfig {
             method_param_count_off:      0x52,
             klass_valuetype_off:         0x2B,
             klass_valuetype_bit:         0x80,
+            method_pointer_off:          0x08,
             method_return_type_off:      0x28,
             method_parameters_off:       0x30,
             method_flags_off:            0x4C,
@@ -210,6 +216,7 @@ impl Il2CppConfig {
             method_param_count_off:      0x52,
             klass_valuetype_off:         0x2B,
             klass_valuetype_bit:         0x80,
+            method_pointer_off:          0x08,
             method_return_type_off:      0x28,
             method_parameters_off:       0x30,
             method_flags_off:            0x4C,
