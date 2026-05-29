@@ -139,6 +139,46 @@ fn host_find_method(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, na
     crate::internals::api::find_method(klass as u64, &String::from_utf8_lossy(&name), argc.max(0) as u32) as i64
 }
 
+fn host_invoke(mut caller: Caller<'_, HostState>, method_ptr: i64, instance_ptr: i64, args_buf: i32, args_len: i32, out_buf: i32, out_cap: i32) -> i32 {
+    use agent_core::spine::{Instance, InvokeArg, MethodPtr};
+
+    let method = MethodPtr::from_raw(method_ptr as u64);
+    let instance = if instance_ptr == 0 { None } else { Some(Instance::from_raw(instance_ptr as u64)) };
+
+    // Read packed args from wasm memory.
+    let buf = match read_guest(&caller, args_buf, args_len) {
+        Some(b) => b,
+        None => return -1,  // ERR_UNREADABLE
+    };
+
+    // Decode args: first u32 is arg_count, then per-arg [tag, payload].
+    if buf.len() < 4 { return -3; }  // ERR_BAD_TYPE — malformed buffer
+    let arg_count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let mut args = Vec::with_capacity(arg_count);
+    let mut cursor = 4usize;
+    for _ in 0..arg_count {
+        match InvokeArg::decode(&buf[cursor..]) {
+            Some((a, consumed)) => { args.push(a); cursor += consumed; }
+            None => return -104, // MarshalFailed
+        }
+    }
+
+    // Call the typed core.
+    match crate::internals::api::invoke_method_t(method, instance, &args) {
+        Ok(ret_val) => {
+            let encoded = ret_val.encode();
+            if encoded.len() > out_cap.max(0) as usize {
+                return -4;  // ERR_BUF_TOO_SMALL
+            }
+            if !write_guest(&mut caller, out_buf, &encoded) {
+                return -1;  // ERR_UNREADABLE (write failed)
+            }
+            0  // OK
+        }
+        Err(e) => i32::from(e),
+    }
+}
+
 /// Run a module with the mem API. `write_granted` decides whether the write
 /// imports exist at all (the gate). Returns the lines it logged.
 pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<String>, WasmError> {
@@ -160,6 +200,7 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
     linker.func_wrap("il2cpp", "klass_of", host_klass_of).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "static_field", host_static_field).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "find_method", host_find_method).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "invoke", host_invoke).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     if write_granted {
         linker.func_wrap("mem", "write", host_write).map_err(|e| WasmError::Instantiate(e.to_string()))?;
         linker.func_wrap("mem", "write_if", host_write_if).map_err(|e| WasmError::Instantiate(e.to_string()))?;

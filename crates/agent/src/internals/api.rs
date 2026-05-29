@@ -243,3 +243,12 @@ pub fn klass_of_t(
         k => Some(agent_core::spine::KlassPtr::from_raw(k)),
     }
 }
+
+/// Typed sibling: invoke a managed method with the spine vocabulary.
+pub fn invoke_method_t(
+    method: agent_core::spine::MethodPtr,
+    instance: Option<agent_core::spine::Instance>,
+    args: &[agent_core::spine::InvokeArg],
+) -> Result<agent_core::spine::InvokeArg, agent_core::spine::InvokeError> {
+    crate::internals::marshal::invoke_method(method, instance, args)
+}

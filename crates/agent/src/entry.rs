@@ -182,6 +182,9 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     if std::env::var("FROG_METHODINFO_PROBE").is_ok() {
         crate::diagnostics::methodinfo_probe::run_methodinfo_probe();
     }
+    if std::env::var("FROG_EXPORT_DUMP").is_ok() {
+        crate::diagnostics::export_dump::run_export_dump_probe();
+    }
 
     crate::runtime::host::maybe_run_configured();
 

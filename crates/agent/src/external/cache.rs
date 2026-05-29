@@ -77,6 +77,9 @@ pub fn read_u64(addr: usize) -> Option<u64> {
 pub fn read_u32(addr: usize) -> Option<u32> {
     if validate_read(addr, 4) { Some(unsafe { *(addr as *const u32) }) } else { None }
 }
+pub fn read_u16(addr: usize) -> Option<u16> {
+    if validate_read(addr, 2) { Some(unsafe { *(addr as *const u16) }) } else { None }
+}
 pub fn read_u8(addr: usize) -> Option<u8> {
     if validate_read(addr, 1) { Some(unsafe { *(addr as *const u8) }) } else { None }
 }
