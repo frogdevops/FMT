@@ -92,7 +92,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     // Bedrock B-1: Phase 0 stability FIRST (wait for classes to finish loading),
     // THEN capture a fresh map, THEN run probe Phases 1-6 against it.
     let phase0 = crate::internals::calibration::stability::await_class_table_stable(
-        &api, table_base, table_count, 8usize,
+        &api, table_base, table_count, 8usize, 5,
     );
     log(&format!("Phase 0 (stability): {}", phase0.summary()));
     let map = RegionMap::capture(8192);
@@ -110,11 +110,17 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
 
     let type_maps = build_type_maps(table_base, table_count, &api, &map, &cfg);
 
+    // Capture a fresh map right before the dump. The probes' map (above) was
+    // taken early — late-loading classes/fields may have allocated new memory
+    // regions since then. A second snapshot ensures the dump sees everything
+    // the game has actually loaded. RegionMap::capture is microseconds.
+    let dump_map = RegionMap::capture(8192);
+
     // Phase 6: find Il2CppMetadataRegistration.types array for typeIndex
-    // resolution (requires `map`).
+    // resolution (requires `dump_map`).
     let types_array = metadata_result.as_ref().and_then(|mr| {
         log(&format!("  metadata: {} type definitions", mr.type_count));
-        let arr = find_types_array(mr.type_count, &map);
+        let arr = find_types_array(mr.type_count, &dump_map);
         match arr {
             Some(a) => log(&format!("  types array @ {:#x}", a)),
             None => log("  types array: not found"),
@@ -128,7 +134,7 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         table_count,
         &api,
         &cfg,
-        &map,
+        &dump_map,
         &type_maps,
         metadata_result.as_ref(),
         types_array,

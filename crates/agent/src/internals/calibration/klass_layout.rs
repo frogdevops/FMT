@@ -185,26 +185,37 @@ pub fn probe_klass_fields(
             } else {
                 // Memory-walk fallback for builds where class_get_fields was not
                 // resolved (e.g. obfuscated/stripped il2cpp like Pixel Worlds).
-                // Peek klass + fallback.klass_fields → FieldInfo array; if the
-                // first element's name pointer resolves to a non-empty cstr the
-                // class has at least one field.
+                // Peek klass + fallback.klass_fields → first FieldInfo slot; a
+                // real field has both a non-empty name AND a non-zero metadata
+                // token (FieldInfo+28). The token check rejects garbage pointers
+                // that happen to point at readable string-like memory.
                 let fallback = crate::internals::config::Il2CppConfig::fallback_constants();
                 let arr = map.read_u64(k + fallback.klass_fields)? as usize;
                 if arr == 0 { return None; }
                 let name_ptr = map.read_u64(arr)? as usize;
                 if name_ptr == 0 { return None; }
                 let name = map.read_name(name_ptr)?;
-                if name.is_empty() { None } else { Some(()) }
+                if name.is_empty() { return None; }
+                let token = map.read_u32(arr + 28)?;
+                if token == 0 { return None; }
+                Some(())
             }
         });
     let total = anchors.len() as u32;
     let extract = |k: &usize, off: usize| -> Option<()> {
         let arr = map.read_u64(k + off)? as usize;
         if arr == 0 { return None; }
-        // FieldInfo[0].name@0 should be a non-empty cstr ptr.
+        // FieldInfo[0].name@0 should be a non-empty cstr ptr and
+        // FieldInfo+28 (token) must be non-zero — matches the dump's
+        // own field filter at build_internals_lines:395. The token check
+        // rejects garbage pointers that happen to point at readable
+        // string-like memory (common on obfuscated builds).
         let name_ptr = map.read_u64(arr)? as usize;
         let name = map.read_name(name_ptr)?;
-        if name.is_empty() { None } else { Some(()) }
+        if name.is_empty() { return None; }
+        let token = map.read_u32(arr + 28)?;
+        if token == 0 { return None; }
+        Some(())
     };
     let result = pick_offset_by_consensus(&candidates, &anchors, extract, MIN_RATIO);
     finalize("klass_fields", result, total, candidates)
