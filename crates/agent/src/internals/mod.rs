@@ -7,4 +7,5 @@ pub mod resolve;
 pub mod dump;
 pub mod ctx;
 pub mod api;
+pub mod hook_runtime;
 pub mod marshal;

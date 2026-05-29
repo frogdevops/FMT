@@ -10,7 +10,7 @@ pub mod invoke_arg;
 pub mod value;
 
 pub use addr::{MemAddr, ReadOnly, ReadWrite};
-pub use error::{InvokeError, MemError};
-pub use handles::{FrameSeq, Instance, KlassPtr, MethodPtr, SocketHandle};
+pub use error::{HookError, InvokeError, MemError};
+pub use handles::{FrameSeq, HookHandle, Instance, KlassPtr, MethodPtr, SocketHandle};
 pub use invoke_arg::InvokeArg;
 pub use value::MemValue;

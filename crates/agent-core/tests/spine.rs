@@ -132,3 +132,35 @@ fn mem_value_all_numerics_have_a_val_type() {
     assert_eq!(<i32 as MemValue>::VAL_TYPE, ValType::I32);
     assert_eq!(<f64 as MemValue>::VAL_TYPE, ValType::F64);
 }
+
+use agent_core::spine::HookError;
+
+#[test]
+fn hook_error_maps_to_distinct_status_range() {
+    // -200..-205 per the spec; all distinct, none collide with MemError (-1..-5)
+    // or InvokeError (-100..-106).
+    let codes = [
+        i32::from(HookError::SlotPoolExhausted),
+        i32::from(HookError::MethodNotHookable),
+        i32::from(HookError::PatchFailed),
+        i32::from(HookError::HandlerNotFound),
+        i32::from(HookError::AlreadyHooked),
+        i32::from(HookError::UnknownHandle),
+    ];
+    for c in codes {
+        assert!(c >= -205 && c <= -200, "hook status {} outside -205..-200", c);
+    }
+    // No overlap with MemError range (-1..-5).
+    for c in codes {
+        assert!(c < -5, "hook status {} overlaps MemError range", c);
+    }
+    // No overlap with InvokeError range (-100..-106).
+    for c in codes {
+        assert!(!(c >= -106 && c <= -100), "hook status {} overlaps InvokeError range", c);
+    }
+    // All distinct.
+    let mut seen = std::collections::HashSet::new();
+    for c in codes {
+        assert!(seen.insert(c), "duplicate hook status code: {}", c);
+    }
+}

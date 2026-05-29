@@ -248,3 +248,185 @@ pub fn invoke_method(
     // 8. Unpack return value.
     unpack_return(sig.return_type, sig.return_tc, ret_ptr)
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Hook-side marshal — bridges captured RegArgs ↔ InvokeArg vocabulary.
+// Used by dispatch_rust (regargs → args), il2cpp.hook_set_arg (args → regargs),
+// il2cpp.hook_set_return / dispatcher return (value → regargs ret slot).
+// ═══════════════════════════════════════════════════════════════════════
+
+use crate::internals::hook_runtime::regargs::RegArgs;
+
+const METHOD_ATTRIBUTE_STATIC_BIT: u32 = 0x10;
+
+/// Convert captured RegArgs to InvokeArg[] for the wasm handler.
+/// Respects the "this-shift" for instance methods (first physical reg is `this`,
+/// declared args start at the next slot).
+pub fn regargs_to_args(
+    method: MethodPtr,
+    regs: &RegArgs,
+) -> Result<Vec<InvokeArg>, InvokeError> {
+    let sig = read_signature(method)?;
+    let reg_offset = if sig.is_static { 0 } else { 1 };
+    let mut out = Vec::with_capacity(sig.param_types.len());
+    for (declared_idx, vt) in sig.param_types.iter().enumerate() {
+        let physical = declared_idx + reg_offset;
+        let arg = read_one_arg_from_regs(*vt, physical, regs)?;
+        out.push(arg);
+    }
+    Ok(out)
+}
+
+fn read_one_arg_from_regs(
+    vt: ValType,
+    physical_slot: usize,
+    regs: &RegArgs,
+) -> Result<InvokeArg, InvokeError> {
+    use agent_core::mem_value::Value;
+    // Args 5+ live on the stack; v1 limits to 4 for now (reads zero/sentinel).
+    if physical_slot >= 4 {
+        return Err(InvokeError::MarshalFailed {
+            idx: physical_slot as u8,
+            reason: "args beyond slot 4 are not captured by RegArgs in v1",
+        });
+    }
+    let v = match vt {
+        ValType::U8  => Value::U8(regs.int_args[physical_slot] as u8),
+        ValType::U16 => Value::U16(regs.int_args[physical_slot] as u16),
+        ValType::U32 => Value::U32(regs.int_args[physical_slot] as u32),
+        ValType::U64 => Value::U64(regs.int_args[physical_slot]),
+        ValType::I8  => Value::I8(regs.int_args[physical_slot] as i8),
+        ValType::I16 => Value::I16(regs.int_args[physical_slot] as i16),
+        ValType::I32 => Value::I32(regs.int_args[physical_slot] as i32),
+        ValType::I64 => Value::I64(regs.int_args[physical_slot] as i64),
+        ValType::F32 => Value::F32(regs.float_args[physical_slot] as f32),
+        ValType::F64 => Value::F64(regs.float_args[physical_slot]),
+        ValType::Bytes | ValType::Cstr => {
+            return Err(InvokeError::MarshalFailed {
+                idx: physical_slot as u8,
+                reason: "variable-length arg types not directly readable from regs",
+            });
+        }
+    };
+    Ok(InvokeArg::Prim(v))
+}
+
+/// Write modified InvokeArg[] back into RegArgs (used before call_original).
+pub fn args_to_regargs(
+    method: MethodPtr,
+    args: &[InvokeArg],
+    regs: &mut RegArgs,
+) -> Result<(), InvokeError> {
+    let sig = read_signature(method)?;
+    if args.len() != sig.param_types.len() {
+        return Err(InvokeError::ArgCountMismatch {
+            expected: sig.param_types.len() as u8,
+            got: args.len() as u8,
+        });
+    }
+    let reg_offset = if sig.is_static { 0 } else { 1 };
+    for (declared_idx, (vt, arg)) in sig.param_types.iter().zip(args.iter()).enumerate() {
+        let physical = declared_idx + reg_offset;
+        write_one_arg_to_regs(*vt, arg_as_value(arg, *vt, physical)?.clone(), physical, regs)?;
+    }
+    Ok(())
+}
+
+fn arg_as_value<'a>(
+    arg: &'a InvokeArg,
+    expected: ValType,
+    idx: usize,
+) -> Result<&'a agent_core::mem_value::Value, InvokeError> {
+    match arg {
+        InvokeArg::Prim(v) if v.val_type() == expected => Ok(v),
+        InvokeArg::Prim(v) => Err(InvokeError::ArgTypeMismatch {
+            idx: idx as u8,
+            expected,
+            got: v.val_type(),
+        }),
+        _ => Err(InvokeError::MarshalFailed {
+            idx: idx as u8,
+            reason: "hook arg writeback only supports primitives in v1",
+        }),
+    }
+}
+
+fn write_one_arg_to_regs(
+    vt: ValType,
+    v: agent_core::mem_value::Value,
+    physical_slot: usize,
+    regs: &mut RegArgs,
+) -> Result<(), InvokeError> {
+    use agent_core::mem_value::Value;
+    if physical_slot >= 4 {
+        return Err(InvokeError::MarshalFailed {
+            idx: physical_slot as u8,
+            reason: "args beyond slot 4 cannot be written via RegArgs in v1",
+        });
+    }
+    match (vt, v) {
+        (ValType::U8,  Value::U8(x))  => regs.int_args[physical_slot] = x as u64,
+        (ValType::U16, Value::U16(x)) => regs.int_args[physical_slot] = x as u64,
+        (ValType::U32, Value::U32(x)) => regs.int_args[physical_slot] = x as u64,
+        (ValType::U64, Value::U64(x)) => regs.int_args[physical_slot] = x,
+        (ValType::I8,  Value::I8(x))  => regs.int_args[physical_slot] = x as i64 as u64,
+        (ValType::I16, Value::I16(x)) => regs.int_args[physical_slot] = x as i64 as u64,
+        (ValType::I32, Value::I32(x)) => regs.int_args[physical_slot] = x as i64 as u64,
+        (ValType::I64, Value::I64(x)) => regs.int_args[physical_slot] = x as u64,
+        (ValType::F32, Value::F32(x)) => regs.float_args[physical_slot] = x as f64,
+        (ValType::F64, Value::F64(x)) => regs.float_args[physical_slot] = x,
+        _ => return Err(InvokeError::ArgTypeMismatch {
+            idx: physical_slot as u8,
+            expected: vt,
+            got: vt,
+        }),
+    }
+    Ok(())
+}
+
+/// Pack a wasm-handler-supplied return value into RegArgs' ret slots.
+/// The dispatcher's shim loads BOTH ret_int and ret_float into RAX+XMM0 on
+/// exit — the original caller picks whichever matches the method's return
+/// type. So we ALWAYS write to whichever slot matches return_type, and zero
+/// the other so a wrong-type read returns 0/NaN deterministically.
+///
+/// Boxed-value semantics: the value travels DIRECTLY through ret_int/ret_float
+/// (no Il2CppObject* box). The trampoline-handoff convention is value-by-value
+/// for primitives, because we're writing to RAX/XMM0 which IS where the
+/// original method would put its un-boxed return value.
+pub fn pack_return_into_regargs(
+    return_type: ValType,
+    _return_tc: u8,
+    value: &InvokeArg,
+    regs: &mut RegArgs,
+) -> Result<(), InvokeError> {
+    use agent_core::mem_value::Value;
+    regs.ret_int = 0;
+    regs.ret_float = 0.0;
+    if let InvokeArg::Null = value { return Ok(()); }
+    let v = match value {
+        InvokeArg::Prim(v) => v,
+        _ => return Err(InvokeError::MarshalFailed {
+            idx: 0,
+            reason: "hook return only supports primitives in v1",
+        }),
+    };
+    match (return_type, v) {
+        (ValType::U8,  Value::U8(x))  => regs.ret_int = *x as u64,
+        (ValType::U16, Value::U16(x)) => regs.ret_int = *x as u64,
+        (ValType::U32, Value::U32(x)) => regs.ret_int = *x as u64,
+        (ValType::U64, Value::U64(x)) => regs.ret_int = *x,
+        (ValType::I8,  Value::I8(x))  => regs.ret_int = *x as i64 as u64,
+        (ValType::I16, Value::I16(x)) => regs.ret_int = *x as i64 as u64,
+        (ValType::I32, Value::I32(x)) => regs.ret_int = *x as i64 as u64,
+        (ValType::I64, Value::I64(x)) => regs.ret_int = *x as u64,
+        (ValType::F32, Value::F32(x)) => regs.ret_float = *x as f64,
+        (ValType::F64, Value::F64(x)) => regs.ret_float = *x,
+        _ => return Err(InvokeError::ArgTypeMismatch {
+            idx: 0,
+            expected: return_type,
+            got: v.val_type(),
+        }),
+    }
+    Ok(())
+}

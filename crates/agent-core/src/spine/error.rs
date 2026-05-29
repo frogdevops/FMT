@@ -52,3 +52,32 @@ impl From<InvokeError> for i32 {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookError {
+    /// No more hook slots available in the thunk slab.
+    SlotPoolExhausted,
+    /// The target method cannot be patched (e.g. too short, native-only).
+    MethodNotHookable,
+    /// Writing the detour patch to the target address failed.
+    PatchFailed,
+    /// No handler registered for the given hook handle.
+    HandlerNotFound,
+    /// A hook is already installed on this method.
+    AlreadyHooked,
+    /// The supplied `HookHandle` is not recognised in the registry.
+    UnknownHandle,
+}
+
+impl From<HookError> for i32 {
+    fn from(e: HookError) -> i32 {
+        match e {
+            HookError::SlotPoolExhausted => -200,
+            HookError::MethodNotHookable => -201,
+            HookError::PatchFailed       => -202,
+            HookError::HandlerNotFound   => -203,
+            HookError::AlreadyHooked     => -204,
+            HookError::UnknownHandle     => -205,
+        }
+    }
+}

@@ -25,3 +25,4 @@ handle_newtype!(MethodPtr,    "A `MethodInfo*` — the il2cpp method handle.");
 handle_newtype!(Instance,     "An object instance pointer.");
 handle_newtype!(FrameSeq,     "A bookmark into the protocol frame ring.");
 handle_newtype!(SocketHandle, "A tracked WinSock socket (proto.send / inject).");
+handle_newtype!(HookHandle,   "An active method-hook registration handle.");
