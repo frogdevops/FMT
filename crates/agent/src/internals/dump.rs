@@ -158,8 +158,11 @@ pub fn build_internals_lines(
         if cls.is_null() {
             continue;
         }
-        let cname = unsafe { cstr_to_string((api.class_get_name)(cls)) };
-        let cns = unsafe { cstr_to_string((api.class_get_namespace)(cls)) };
+        let mut cname = unsafe { cstr_to_string((api.class_get_name)(cls)) };
+        let     cns   = unsafe { cstr_to_string((api.class_get_namespace)(cls)) };
+        if cname.is_empty() && cns.is_empty() {
+            cname = format!("<generic @ {:#x}>", cls as usize);
+        }
         let key = (cns.clone(), cname.clone());
 
         let rt_fields = collect_runtime_fields(cls, api, cfg, map, type_maps);
@@ -379,20 +382,24 @@ fn collect_runtime_fields(
                 if fname.is_empty() {
                     continue;
                 }
+                // Read token first; bail early if scanner garbage. Mirrors api.rs ordering.
+                let token = map.read_u32(f + 28).unwrap_or(0);
+                if token == 0 { continue; }   // scanner garbage: real fields always have a metadata token
                 let type_ptr = map.read_u64(f + 8).unwrap_or(0) as usize;
-                let ftype = if type_ptr != 0 {
-                    il2cpp_type_name(map, type_ptr, type_maps, cfg, api, ctx.as_ref())
-                } else {
-                    "?".to_string()
-                };
+                // Validate type_ptr produces a plausible type code. Garbage FieldInfo
+                // entries past the real array end have type_ptr pointing to random
+                // memory that doesn't decode as a valid tc in 0x01..=0x45.
+                if type_ptr == 0 { continue; }
+                let chunk = map.read_u64(type_ptr + cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
+                let tc = ((chunk >> cfg.discrim_shift) & 0xFF) as u8;
+                if tc == 0 || tc > 0x45 { continue; }
+                let ftype = il2cpp_type_name(map, type_ptr, type_maps, cfg, api, ctx.as_ref());
                 let raw_offset = map.read_u32(f + 24).unwrap_or(0);
                 let offset = if crate::internals::api::klass_is_valuetype_via_map(cls as usize as u64, cfg, map) {
                     raw_offset.saturating_sub(0x10)
                 } else {
                     raw_offset
                 };
-                let token = map.read_u32(f + 28).unwrap_or(0);
-                if token == 0 { continue; }   // scanner garbage: real fields always have a metadata token
                 rt_fields.push((fname, ftype, offset, token));
             }
         }

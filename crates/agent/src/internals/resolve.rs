@@ -321,7 +321,43 @@ fn il2cpp_type_name_depth(
             };
         }
         0x1C => return "System.Object".into(),
+        0x20 | 0x21 => {
+            // CMOD_REQD / CMOD_OPT — wrap an inner Il2CppType. data64 → inner type ptr.
+            let inner = data64 as usize;
+            if inner != 0 {
+                return il2cpp_type_name_depth(map, inner, type_maps, cfg, api, ctx, depth + 1);
+            }
+            return "<cmod-unresolved>".into();
+        }
+        0x40 => {
+            // MODIFIER — wrap an inner type.
+            let inner = data64 as usize;
+            if inner != 0 {
+                return il2cpp_type_name_depth(map, inner, type_maps, cfg, api, ctx, depth + 1);
+            }
+            return "<modifier-unresolved>".into();
+        }
+        0x41 => {
+            // SENTINEL — varargs marker; inner type follows.
+            let inner = data64 as usize;
+            if inner != 0 {
+                return il2cpp_type_name_depth(map, inner, type_maps, cfg, api, ctx, depth + 1);
+            }
+            return "<sentinel-unresolved>".into();
+        }
+        0x45 => {
+            // PINNED — pinned modifier.
+            let inner = data64 as usize;
+            if inner != 0 {
+                return il2cpp_type_name_depth(map, inner, type_maps, cfg, api, ctx, depth + 1);
+            }
+            return "<pinned-unresolved>".into();
+        }
         _ => {}
     }
-    format!("<type:{}>", tc)
+    if tc <= 0x45 {
+        format!("<unhandled-tc:0x{:02x}>", tc)
+    } else {
+        format!("<garbage-tc:0x{:02x} @ {:#x}>", tc, type_ptr)
+    }
 }

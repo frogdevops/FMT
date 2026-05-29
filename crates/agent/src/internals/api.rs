@@ -59,6 +59,13 @@ fn for_each_field(klass: usize, mut f: impl FnMut(&str, u32, usize) -> bool) {
             let token = cache::read_u32(slot + 28).unwrap_or(0);
             if token == 0 { continue; }   // scanner garbage: real fields always have a metadata token
             let type_ptr = cache::read_u64(slot + 8).unwrap_or(0) as usize;
+            // Validate type_ptr produces a plausible type code. Garbage FieldInfo
+            // entries past the real array end have type_ptr pointing to random
+            // memory that doesn't decode as a valid tc in 0x01..=0x45.
+            if type_ptr == 0 { continue; }
+            let chunk = cache::read_u64(type_ptr + c.cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
+            let tc = ((chunk >> c.cfg.discrim_shift) & 0xFF) as u8;
+            if tc == 0 || tc > 0x45 { continue; }
             let raw_offset = cache::read_u32(slot + 24).unwrap_or(0);
             let offset = if klass_is_valuetype(klass as u64) {
                 raw_offset.saturating_sub(0x10)
