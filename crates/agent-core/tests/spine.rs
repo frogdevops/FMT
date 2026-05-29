@@ -66,7 +66,28 @@ fn handle_round_trips() {
 }
 
 use agent_core::mem_value::ValType;
-use agent_core::spine::MemValue;
+use agent_core::spine::{InvokeError, MemValue};
+
+#[test]
+fn invoke_error_maps_to_distinct_status_range() {
+    // -100..-106 per the spec; all distinct, none collide with MemError (-1..-5).
+    let codes = [
+        i32::from(InvokeError::NotFound),
+        i32::from(InvokeError::ArgCountMismatch { expected: 0, got: 0 }),
+        i32::from(InvokeError::ArgTypeMismatch { idx: 0, expected: ValType::U8, got: ValType::U8 }),
+        i32::from(InvokeError::NullInstance),
+        i32::from(InvokeError::MarshalFailed { idx: 0, reason: "" }),
+        i32::from(InvokeError::ManagedException(String::new())),
+        i32::from(InvokeError::InternalFailure("")),
+    ];
+    for c in codes {
+        assert!(c >= -106 && c <= -100, "invoke status {} outside -100..-106", c);
+    }
+    // No overlap with MemError range.
+    for c in codes {
+        assert!(c < status::ERR_UNREADABLE && c > -200, "invoke status {} overlaps mem/hook range", c);
+    }
+}
 
 #[test]
 fn mem_value_u32_round_trip() {

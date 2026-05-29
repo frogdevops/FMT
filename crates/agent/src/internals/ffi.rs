@@ -10,6 +10,10 @@ pub type Il2CppClass = c_void;
 pub type FieldInfo = c_void;
 pub type Il2CppType = c_void;
 pub type Il2CppThread = c_void;
+pub type MethodInfo      = c_void;
+pub type Il2CppString    = c_void;
+pub type Il2CppArray     = c_void;
+pub type Il2CppException = c_void;
 
 type DomainGet = unsafe extern "C" fn() -> *mut Il2CppDomain;
 type DomainGetAssemblies =
@@ -25,6 +29,15 @@ type FieldGetType = unsafe extern "C" fn(*mut FieldInfo) -> *mut Il2CppType;
 type TypeGetName = unsafe extern "C" fn(*mut Il2CppType) -> *mut c_char;
 type ThreadAttach = unsafe extern "C" fn(*mut Il2CppDomain) -> *mut Il2CppThread;
 type ImageGetName = unsafe extern "C" fn(*mut Il2CppImage) -> *const c_char;
+type RuntimeInvoke = unsafe extern "C" fn(
+    *mut MethodInfo,
+    *mut c_void,
+    *mut *mut c_void,
+    *mut *mut Il2CppException,
+) -> *mut c_void;
+type StringNew           = unsafe extern "C" fn(*const c_char) -> *mut Il2CppString;
+type ArrayNew            = unsafe extern "C" fn(*mut Il2CppClass, usize) -> *mut Il2CppArray;
+type ExceptionGetMessage = unsafe extern "C" fn(*mut Il2CppException) -> *mut Il2CppString;
 
 /// Resolved il2cpp entry points.
 ///
@@ -52,6 +65,10 @@ pub struct Il2CppApi {
     pub type_get_name: TypeGetName,
     pub thread_attach: Option<ThreadAttach>,
     pub image_get_name: ImageGetName,
+    pub runtime_invoke:        Option<RuntimeInvoke>,
+    pub string_new:            Option<StringNew>,
+    pub array_new:             Option<ArrayNew>,
+    pub exception_get_message: Option<ExceptionGetMessage>,
 }
 
 unsafe fn resolve(
@@ -292,6 +309,51 @@ unsafe fn resolve_scrambled_exports(
     let thread_attach_opt: Option<&ExportedFunc> = None;
     let _ = is_throw_stub; // silence dead-code lint when we don't probe a name
 
+    // 13. runtime_invoke — large body. PW-derived prologue pattern (stable across v24
+    //     within PW; may need re-fingerprinting for other obfuscated games).
+    //     Typical opening: `sub rsp, X; mov [rsp+0x20], r9; mov r10, rdx`.
+    //     If the pattern doesn't match, the entire sig-scan resolver returns None
+    //     and invoke stays disabled — non-fatal for the rest of the agent.
+    let pat_runtime_invoke: [u16; 12] = [
+        0x48, 0x83, 0xEC, 0x100,        // sub rsp, X
+        0x4C, 0x89, 0x4C, 0x24, 0x20,   // mov [rsp+0x20], r9   (the exc out-param)
+        0x49, 0x89, 0xD2,                // mov r10, rdx           (this ptr scratch)
+    ];
+    let runtime_invoke_func = resolved_exports.iter().find(|exp| {
+        matches_pattern(exp.code_slice, &pat_runtime_invoke)
+    });
+    crate::paths::log(&format!(
+        "  sig-scan: runtime_invoke found = {}",
+        runtime_invoke_func.is_some()
+    ));
+
+    // 14. string_new — `il2cpp_string_new` forwards to a small constructor.
+    //     Pattern: `48 89 5C 24 ?? 57 48 83 EC 20` (push rbx + shadow space).
+    let pat_string_new: [u16; 10] = [
+        0x48, 0x89, 0x5C, 0x24, 0x100,
+        0x57, 0x48, 0x83, 0xEC, 0x20,
+    ];
+    let string_new_func = resolved_exports.iter().find(|exp| {
+        matches_pattern(exp.code_slice, &pat_string_new)
+    });
+
+    // 15. array_new — same prologue shape as string_new; for PW, the second match
+    //     in the export table is the right one.
+    let array_new_candidates: Vec<_> = resolved_exports.iter().filter(|exp| {
+        matches_pattern(exp.code_slice, &pat_string_new)
+    }).collect();
+    let array_new_func = array_new_candidates.get(1).copied();
+
+    // 16. exception_get_message — reads exc->message at offset 0x18 typically.
+    //     Pattern: `48 8B 41 18 C3` (we already use this for class_get_namespace —
+    //     pick the candidate that's NOT class_get_namespace by exclusion).
+    let exception_get_message_candidates: Vec<_> = resolved_exports.iter().filter(|exp| {
+        matches_pattern(exp.code_slice, &pat_offset_18)
+    }).collect();
+    let exception_get_message_func = exception_get_message_candidates.iter()
+        .find(|f| f.final_addr != class_get_namespace_func.final_addr)
+        .copied();
+
     Some(Il2CppApi {
         domain_get: std::mem::transmute::<*const u8, DomainGet>(domain_get_func.final_addr),
         domain_get_assemblies: std::mem::transmute::<*const u8, DomainGetAssemblies>(domain_get_assemblies_func.final_addr),
@@ -306,6 +368,18 @@ unsafe fn resolve_scrambled_exports(
         type_get_name: std::mem::transmute::<*const u8, TypeGetName>(type_get_name_func.final_addr),
         thread_attach: thread_attach_opt.map(|f| std::mem::transmute::<*const u8, ThreadAttach>(f.final_addr)),
         image_get_name: std::mem::transmute::<*const u8, ImageGetName>(assembly_get_image_func.final_addr),
+        runtime_invoke: runtime_invoke_func.map(|f|
+            std::mem::transmute::<*const u8, RuntimeInvoke>(f.final_addr)
+        ),
+        string_new: string_new_func.map(|f|
+            std::mem::transmute::<*const u8, StringNew>(f.final_addr)
+        ),
+        array_new: array_new_func.map(|f|
+            std::mem::transmute::<*const u8, ArrayNew>(f.final_addr)
+        ),
+        exception_get_message: exception_get_message_func.map(|f|
+            std::mem::transmute::<*const u8, ExceptionGetMessage>(f.final_addr)
+        ),
     })
 }
 
@@ -321,11 +395,25 @@ impl Il2CppApi {
     pub unsafe fn resolve() -> Option<Il2CppApi> {
         if let Some(api) = Self::resolve_from_game_assembly() {
             crate::paths::log("  il2cpp API resolved via standard exports");
+            crate::paths::log(&format!(
+                "    invoke caps: runtime_invoke={} string_new={} array_new={} exception_get_message={}",
+                api.runtime_invoke.is_some(),
+                api.string_new.is_some(),
+                api.array_new.is_some(),
+                api.exception_get_message.is_some(),
+            ));
             return Some(api);
         }
         match Self::resolve_obfuscated_api() {
             Some(api) => {
                 crate::paths::log("  il2cpp API resolved via signature scan (obfuscated build)");
+                crate::paths::log(&format!(
+                    "    invoke caps: runtime_invoke={} string_new={} array_new={} exception_get_message={}",
+                    api.runtime_invoke.is_some(),
+                    api.string_new.is_some(),
+                    api.array_new.is_some(),
+                    api.exception_get_message.is_some(),
+                ));
                 Some(api)
             }
             None => {
@@ -369,6 +457,14 @@ pub unsafe fn resolve_from_game_assembly() -> Option<Il2CppApi> {
                     std::mem::transmute::<*const c_void, $ty>(p)
                 }};
             }
+            // Optional variant of get_std: returns Some on success, None if the export
+            // isn't found by that exact name. Used for FFI slots that aren't required
+            // for the agent to start.
+            macro_rules! try_get_std {
+                ($name:literal, $ty:ty) => {{
+                    resolve(module, $name).map(|p| std::mem::transmute::<*const c_void, $ty>(p))
+                }};
+            }
             Some(Il2CppApi {
                 domain_get: get_std!(b"il2cpp_domain_get\0", DomainGet),
                 domain_get_assemblies: get_std!(b"il2cpp_domain_get_assemblies\0", DomainGetAssemblies),
@@ -383,6 +479,10 @@ pub unsafe fn resolve_from_game_assembly() -> Option<Il2CppApi> {
                 type_get_name: get_std!(b"il2cpp_type_get_name\0", TypeGetName),
                 thread_attach: Some(get_std!(b"il2cpp_thread_attach\0", ThreadAttach)),
                 image_get_name: get_std!(b"il2cpp_image_get_name\0", ImageGetName),
+                runtime_invoke:        try_get_std!(b"il2cpp_runtime_invoke\0",        RuntimeInvoke),
+                string_new:            try_get_std!(b"il2cpp_string_new\0",            StringNew),
+                array_new:             try_get_std!(b"il2cpp_array_new\0",             ArrayNew),
+                exception_get_message: try_get_std!(b"il2cpp_exception_get_message\0", ExceptionGetMessage),
             })
         };
 

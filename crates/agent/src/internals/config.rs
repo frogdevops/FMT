@@ -83,6 +83,19 @@ pub struct Il2CppConfig {
     /// bitfield, the valuetype bit per standard il2cpp ABI).
     pub klass_valuetype_off: usize,
     pub klass_valuetype_bit: u8,
+
+    // ── MethodInfo / ParameterInfo ───────────────────────────────
+    /// Offset of the `return_type` ptr (→ Il2CppType*) within MethodInfo.
+    /// Derived structurally via diagnostics::methodinfo_probe.
+    pub method_return_type_off: usize,
+    /// Offset of the `parameters` ptr (→ ParameterInfo[]) within MethodInfo.
+    pub method_parameters_off: usize,
+    /// Offset of the `flags` u32 within MethodInfo. METHOD_ATTRIBUTE_STATIC = 0x10.
+    pub method_flags_off: usize,
+    /// Stride between ParameterInfo entries. Probed via PadLeft(Int32, Char).
+    pub param_info_size: usize,
+    /// Offset of the type ptr within ParameterInfo. Probed: type is the FIRST field.
+    pub param_info_type_off: usize,
 }
 
 impl Il2CppConfig {
@@ -145,6 +158,11 @@ impl Il2CppConfig {
             method_param_count_off:      0x52,
             klass_valuetype_off:         0x2B,
             klass_valuetype_bit:         0x80,
+            method_return_type_off:      0x28,
+            method_parameters_off:       0x30,
+            method_flags_off:            0x4C,
+            param_info_size:             0x18,
+            param_info_type_off:         0x00,
         }
     }
 
@@ -192,6 +210,11 @@ impl Il2CppConfig {
             method_param_count_off:      0x52,
             klass_valuetype_off:         0x2B,
             klass_valuetype_bit:         0x80,
+            method_return_type_off:      0x28,
+            method_parameters_off:       0x30,
+            method_flags_off:            0x4C,
+            param_info_size:             0x18,
+            param_info_type_off:         0x00,
         }
     }
 }
