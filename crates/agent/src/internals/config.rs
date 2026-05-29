@@ -104,50 +104,12 @@ pub struct Il2CppConfig {
 }
 
 impl Il2CppConfig {
-    /// Default layout for the v24 metadata group (Unity 2017–2019).
-    /// These offsets work for the majority of il2cpp games from that era.
-    pub const fn default() -> Self {
-        Self::v24()
-    }
+    // ── Baseline constants ───────────────────────────────────────
 
-    /// Return a config for a known metadata version, or `None` if the
-    /// version is not yet supported.  When `None` the caller should
-    /// fall back to `Il2CppConfig::default()` (which will work for
-    /// most Unity 2017–2020 games).
-    pub fn for_metadata_version(version: u32) -> Option<Self> {
-        match version {
-            // v24 is the baseline — covers Unity 2017–2019
-            24 | 25 | 26 => Some(Self::v24()),
-            // v27 (Unity 2020.x) — same Il2CppClass layout as v24
-            27 | 28 => Some(Self::v27()),
-            // v29 (Unity 2021.3) — still uses inline byval_arg at +0x20
-            29 => Some(Self::v29()),
-            // v30+ (Unity 2022+) — byval_arg becomes a pointer;
-            // klass_type_def moves to typeDefinition at +0x68.
-            30 | 31 => Some(Self::v30()),
-            _ => None,
-        }
-    }
-
-    // ── Version instances ────────────────────────────────────────
-
-    /// v24 baseline — covers Unity 2017–2019 (metadata v24–v26).
-    ///
-    /// Il2CppClass inline layout:
-    ///   +0x00  image           (void*)
-    ///   +0x08  gc_desc         (void*)
-    ///   +0x10  name            (const char*)
-    ///   +0x18  namespaze       (const char*)
-    ///   +0x20  byval_arg       (Il2CppType, 16 bytes inline)
-    ///   +0x30  this_arg        (Il2CppType, 16 bytes inline)
-    ///   …
-    ///   +0x58  parent          (Il2CppClass*)
-    ///   +0x68  typeDefinition  (void*)
-    ///
-    /// Il2CppType:
-    ///   +0x00  data            (8 bytes — packed typeDefIndex + flags)
-    ///   +0x08  attrs / type    (u32 — discriminator at byte 2)
-    const fn v24() -> Self {
+    /// Last-resort baseline. Values empirically validated on Unity 2019/2021 era
+    /// IL2CPP runtimes. Used as the initial seed for `probe()` and as the per-
+    /// field fallback when an individual probe fails.
+    pub fn fallback_constants() -> Self {
         Self {
             class_table_step:            8,
             klass_namespace:             0x18,
@@ -172,56 +134,106 @@ impl Il2CppConfig {
         }
     }
 
-    /// v27 — Unity 2020.x (metadata v27–v28).
-    ///
-    /// Identical Il2CppClass layout to v24.  No runtime struct changes.
-    const fn v27() -> Self {
-        Self::v24()
+    /// Probe-and-Verify Discipline: derive every offset from live FFI ground
+    /// truth. Returns (config, ConfidenceReport). Phase 1 failure terminates;
+    /// other phases fall back to `fallback_constants()` per-field.
+    pub fn probe(
+        map: &crate::external::region_map::RegionMap,
+        api: &crate::internals::ffi::Il2CppApi,
+        table_base: usize,
+        table_count: usize,
+        phase0: crate::internals::calibration::stability::StabilityResult,
+    ) -> (Self, crate::internals::calibration::ConfidenceReport) {
+        use crate::internals::calibration::{
+            klass_layout, method_layout, type_discrim,
+            field_param_layout, ffi_verify, metadata_version,
+        };
+
+        let mut cfg = Self::fallback_constants();
+
+        // Phase 0 stability is computed by the caller (entry.rs) BEFORE the map
+        // snapshot, so the map reflects classes that have finished loading.
+
+        // Phase 1 (FATAL)
+        crate::paths::log("probe: Phase 1 (klass) ENTER");
+        let n = klass_layout::probe_klass_namespace(api, map, table_base, table_count, cfg.class_table_step);
+        let td = klass_layout::probe_klass_type_def(api, map, table_base, table_count, cfg.class_table_step);
+        let fl = klass_layout::probe_klass_fields(api, map, table_base, table_count, cfg.class_table_step);
+        let me = klass_layout::probe_klass_methods(api, map, table_base, table_count, cfg.class_table_step);
+        let sf = klass_layout::probe_klass_static_fields(api, map, table_base, table_count, cfg.class_table_step);
+        let (vt, vt_bit) = klass_layout::probe_klass_valuetype(api, map);
+        crate::paths::log("probe: Phase 1 (klass) EXIT");
+        cfg.klass_namespace      = n.winning_offset.unwrap_or(cfg.klass_namespace);
+        cfg.klass_type_def       = td.winning_offset.unwrap_or(cfg.klass_type_def);
+        cfg.klass_fields         = fl.winning_offset.unwrap_or(cfg.klass_fields);
+        cfg.klass_methods        = me.winning_offset.unwrap_or(cfg.klass_methods);
+        cfg.klass_static_fields  = sf.winning_offset.unwrap_or(cfg.klass_static_fields);
+        cfg.klass_valuetype_off  = vt.winning_offset.unwrap_or(cfg.klass_valuetype_off);
+        if let Some(b) = vt_bit { cfg.klass_valuetype_bit = b; }
+        let phase1 = vec![n, td, fl, me, sf, vt];
+
+        // Phase 2
+        crate::paths::log("probe: Phase 2 (method) ENTER");
+        let mp = method_layout::probe_method_pointer_off(map);
+        let mn = method_layout::probe_method_name_off(map);
+        let mk = method_layout::probe_method_klass_off(map);
+        let mf = method_layout::probe_method_flags_off(map);
+        let mpars = method_layout::probe_method_parameters_off(map);
+        let mret = method_layout::probe_method_return_type_off(map);
+        let mpc = method_layout::probe_method_param_count_off(map);
+        cfg.method_pointer_off      = mp.winning_offset.unwrap_or(cfg.method_pointer_off);
+        cfg.method_name_off         = mn.winning_offset.unwrap_or(cfg.method_name_off);
+        cfg.method_klass_off        = mk.winning_offset.unwrap_or(cfg.method_klass_off);
+        cfg.method_flags_off        = mf.winning_offset.unwrap_or(cfg.method_flags_off);
+        cfg.method_parameters_off   = mpars.winning_offset.unwrap_or(cfg.method_parameters_off);
+        cfg.method_return_type_off  = mret.winning_offset.unwrap_or(cfg.method_return_type_off);
+        cfg.method_param_count_off  = mpc.winning_offset.unwrap_or(cfg.method_param_count_off);
+        let phase2 = vec![mp, mn, mk, mf, mpars, mret, mpc];
+        crate::paths::log("probe: Phase 2 (method) EXIT");
+
+        // Phase 3
+        crate::paths::log("probe: Phase 3 (type_discrim) ENTER");
+        let (td_read, td_shift) = type_discrim::probe_type_discrim(map, cfg.klass_type_def);
+        cfg.il2cpp_type_discrim_read_at = td_read.winning_offset.unwrap_or(cfg.il2cpp_type_discrim_read_at);
+        cfg.discrim_shift               = td_shift.winning_offset.unwrap_or(cfg.discrim_shift as usize) as u8;
+        let phase3 = vec![td_read, td_shift];
+        crate::paths::log("probe: Phase 3 (type_discrim) EXIT");
+
+        // Phase 4
+        crate::paths::log("probe: Phase 4 (field_param) ENTER");
+        let (pi_size, pi_type) = field_param_layout::probe_param_info(
+            map, cfg.klass_type_def, cfg.il2cpp_type_discrim_read_at,
+            cfg.discrim_shift as usize, cfg.method_parameters_off,
+        );
+        cfg.param_info_size     = pi_size.winning_offset.unwrap_or(cfg.param_info_size);
+        cfg.param_info_type_off = pi_type.winning_offset.unwrap_or(cfg.param_info_type_off);
+        let phase4 = vec![pi_size, pi_type];
+        crate::paths::log("probe: Phase 4 (field_param) EXIT");
+
+        // Phase 5
+        crate::paths::log("probe: Phase 5 (ffi_verify) ENTER");
+        let phase5 = ffi_verify::run_verification(api);
+        crate::paths::log("probe: Phase 5 (ffi_verify) EXIT");
+
+        // Phase 6
+        crate::paths::log("probe: Phase 6 (metadata) ENTER");
+        let phase6 = metadata_version::probe_metadata_version();
+        crate::paths::log("probe: Phase 6 (metadata) EXIT");
+
+        let report = crate::internals::calibration::ConfidenceReport {
+            phase0_stability: phase0,
+            phase1_klass: phase1,
+            phase2_method: phase2,
+            phase3_type_discrim: phase3,
+            phase4_field_param: phase4,
+            phase5_ffi: phase5,
+            phase6_metadata_version: phase6,
+        };
+        (cfg, report)
     }
 
-    /// v29 — Unity 2021.3 (metadata v29).
-    ///
-    /// Identical Il2CppClass layout to v24.  The `typeDefinition` field
-    /// was renamed `typeMetadataHandle` but remains at +0x68 and
-    /// `byval_arg` is still inline at +0x20.
-    const fn v29() -> Self {
-        Self::v24()
-    }
+}
 
-    /// v30 — Unity 2022.x (metadata v30–v31).
-    ///
-    /// **Known change**: `byval_arg` / `this_arg` became pointers
-    /// (`Il2CppType*`) instead of inline structs (16 bytes → 8 bytes
-    /// each).  This shifts every field at +0x30 + by −16 bytes.
-    ///   - `klass_type_def` → +0x68 (typeDefinition / typeMetadataHandle)
-    ///   - `klass_generic_class` → +0x38 (was +0x48)
-    ///   - `klass_fields` → +0x70 (was +0x80)
-    ///
-    /// ⚠  All v30+ offsets are deduced from the size change, not
-    /// empirically verified.  If you hit a metadata v30+ game and
-    /// output is wrong, these are the offsets to check first.
-    const fn v30() -> Self {
-        Self {
-            class_table_step:            8,
-            klass_namespace:             0x18,
-            klass_type_def:              0x68,   // typeDefinition / typeMetadataHandle
-            klass_generic_class:         0x38,   // guessed (shifted by −16)
-            klass_fields:                0x70,   // guessed (shifted by −16)
-            il2cpp_type_discrim_read_at: 0x08,
-            discrim_shift:               16,
-            klass_methods:               0x88,   // klass_fields (0x70) + 0x18
-            klass_static_fields:         0xA8,   // klass_fields (0x70) + 0x38
-            method_name_off:             0x18,
-            method_klass_off:            0x20,
-            method_param_count_off:      0x52,
-            klass_valuetype_off:         0x2B,
-            klass_valuetype_bit:         0x80,
-            method_pointer_off:          0x08,
-            method_return_type_off:      0x28,
-            method_parameters_off:       0x30,
-            method_flags_off:            0x4C,
-            param_info_size:             0x18,
-            param_info_type_off:         0x00,
-        }
-    }
+impl Default for Il2CppConfig {
+    fn default() -> Self { Self::fallback_constants() }
 }

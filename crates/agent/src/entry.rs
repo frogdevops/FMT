@@ -89,23 +89,25 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         }
     };
 
-    // Phase 4: pick the per-version struct-offset config.
-    let cfg = metadata_result
-        .as_ref()
-        .and_then(|mr| Il2CppConfig::for_metadata_version(mr.version))
-        .unwrap_or_else(Il2CppConfig::default);
-    let ver_str = metadata_result
-        .as_ref()
-        .map_or("unknown".into(), |mr| mr.version.to_string());
-    log(&format!(
-        "  config: metadata v{}, klass_namespace={:#x}, klass_type_def={:#x}",
-        ver_str, cfg.klass_namespace, cfg.klass_type_def
-    ));
-
-    // Phase 5: wait 8s for classes to finish loading, then snapshot memory.
-    log("  waiting 8s for classes to load...");
-    std::thread::sleep(Duration::from_secs(8));
+    // Bedrock B-1: Phase 0 stability FIRST (wait for classes to finish loading),
+    // THEN capture a fresh map, THEN run probe Phases 1-6 against it.
+    let phase0 = crate::internals::calibration::stability::await_class_table_stable(
+        &api, table_base, table_count, 8usize,
+    );
+    log(&format!("Phase 0 (stability): {}", phase0.summary()));
     let map = RegionMap::capture(8192);
+    let (cfg, calibration_report) =
+        Il2CppConfig::probe(&map, &api, table_base, table_count, phase0);
+    calibration_report.log();
+
+    // Phase 1 (klass layout) failure → terminate. The agent loads but does
+    // nothing useful — operator must inspect the calibration block.
+    use crate::internals::calibration::klass_layout::any_critical_failed;
+    if any_critical_failed(&calibration_report.phase1_klass) {
+        log("CALIBRATION FATAL: Phase 1 klass layout probe failed. Terminating worker.");
+        return 0;
+    }
+
     let type_maps = build_type_maps(table_base, table_count, &api, &map, &cfg);
 
     // Phase 6: find Il2CppMetadataRegistration.types array for typeIndex
@@ -171,16 +173,6 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     // Round-2 recon: MethodInfo layout + FieldInfo static flag.
     if std::env::var("FROG_MEMBER_PROBE").is_ok() {
         crate::diagnostics::klass_probe::run_member_probe();
-    }
-    // Opt-in valuetype-flag offset probe (FROG_VALUETYPE_PROBE): diffs System.Int32
-    // (value type) against System.String (reference type) to derive the
-    // Il2CppClass::valuetype flag offset+bit. Results are logged for operator review
-    // and banked into internals/config.rs (Task 3).
-    if std::env::var("FROG_VALUETYPE_PROBE").is_ok() {
-        crate::diagnostics::valuetype_probe::run_valuetype_probe();
-    }
-    if std::env::var("FROG_METHODINFO_PROBE").is_ok() {
-        crate::diagnostics::methodinfo_probe::run_methodinfo_probe();
     }
     if std::env::var("FROG_EXPORT_DUMP").is_ok() {
         crate::diagnostics::export_dump::run_export_dump_probe();
