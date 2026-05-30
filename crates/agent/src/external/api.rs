@@ -55,23 +55,53 @@ pub fn write_if(addr: usize, expected: &Value, new: &Value) -> Result<bool, i32>
     Ok(true)
 }
 
+// ── mem_backend registration ─────────────────────────────────────────────────
+// The Read<T>/Write<T> impls for MemAddr<C> and FieldAddr live in agent_core
+// (where those types are defined, satisfying the orphan rule). They delegate
+// I/O to the static vtable in `agent_core::spine::mem_backend`. We register
+// the real Windows-backed implementations here, at the external API layer, so
+// no FFI reaches into agent_core.
+
+/// Raw validated read: copies `len` bytes from `addr` into `out` after checking
+/// the region cache. Returns `true` on success.
+///
+/// # Safety
+/// `out` must point to a buffer of at least `len` bytes.
+unsafe fn backend_read(addr: usize, out: *mut u8, len: usize) -> bool {
+    if !cache::validate_read(addr, len) {
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(addr as *const u8, out, len);
+    true
+}
+
+/// Raw guarded write: writes `len` bytes from `src` into `addr` using
+/// the proven VirtualProtect guard. Returns `true` on success.
+///
+/// # Safety
+/// `src` must point to a buffer of at least `len` bytes.
+unsafe fn backend_write(addr: usize, src: *const u8, len: usize) -> bool {
+    let slice = std::slice::from_raw_parts(src, len);
+    guarded_write(addr, slice).is_ok()
+}
+
+/// Register the Windows-backed read/write implementations with agent_core's
+/// mem_backend vtable. Must be called once before any `Read<T>`/`Write<T>`
+/// trait methods are invoked (i.e. after `cache::start_refresher()`).
+pub fn register_mem_backend() {
+    agent_core::spine::mem_backend::register(backend_read, backend_write);
+}
+
 /// Typed read: `let v: u32 = api::read_t(addr)?;`. Accepts a `MemAddr` of any
 /// capability (reads work on ReadOnly and ReadWrite alike).
 pub fn read_t<T: MemValue, C>(addr: MemAddr<C>) -> Result<T, MemError> {
-    let width = T::VAL_TYPE.fixed_width().ok_or(MemError::BadType)?;
-    let a = addr.as_u64() as usize;
-    if !cache::validate_read(a, width) {
-        return Err(MemError::Unreadable);
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(a as *const u8, width) };
-    T::from_le_bytes_spine(bytes).ok_or(MemError::BadType)
+    agent_core::spine::Read::<T>::read(&addr)
 }
 
 /// Typed write: requires `MemAddr<ReadWrite>` — passing a ReadOnly handle is a
 /// compile-time error (the trait bound on the parameter type rejects it).
 pub fn write_t<T: MemValue>(addr: MemAddr<ReadWrite>, val: T) -> Result<(), MemError> {
-    let bytes = val.to_le_bytes_buf();
-    unsafe { guarded_write(addr.as_u64() as usize, &bytes) }.map_err(|_| MemError::Unwritable)
+    agent_core::spine::Write::<T>::write(&addr, val)
 }
 
 /// Typed variable-length read: bytes. Capability-agnostic.

@@ -211,18 +211,20 @@ pub fn find_method_t(
 }
 
 /// Typed address of an instance field: `instance + field_info(klass, name).offset`.
-/// Returns `MemAddr<ReadWrite>` — instance fields are writable by intent.
+/// Returns a `FieldAddr` carrying both the writable raw address and the
+/// decoded `ValType` so downstream `Write<T>` calls can enforce type-match.
 /// Returns `None` if the field is not found on the class.
 pub fn field_addr_t(
     klass: agent_core::spine::KlassPtr,
     name: &str,
     instance: agent_core::spine::Instance,
-) -> Option<agent_core::spine::MemAddr<agent_core::spine::ReadWrite>> {
-    let (offset, _vt) = field_info(klass.as_u64(), name)?;
-    let addr = (instance.as_u64() as usize).wrapping_add(offset as usize) as u64;
+) -> Option<agent_core::spine::FieldAddr> {
+    let (offset, vt) = field_info(klass.as_u64(), name)?;
+    let addr_raw = (instance.as_u64() as usize).wrapping_add(offset as usize) as u64;
     // SAFETY: caller obtained `instance` via the spine API; instance fields
     // are writable by their semantic role.
-    Some(unsafe { agent_core::spine::MemAddr::from_raw_writable(addr) })
+    let addr = unsafe { agent_core::spine::MemAddr::from_raw_writable(addr_raw) };
+    Some(agent_core::spine::FieldAddr::new(addr, vt))
 }
 
 /// Typed address of a static field. Returns `MemAddr<ReadWrite>` — statics
@@ -258,4 +260,99 @@ pub fn invoke_method_t(
     args: &[agent_core::spine::InvokeArg],
 ) -> Result<agent_core::spine::InvokeArg, agent_core::spine::InvokeError> {
     crate::internals::marshal::invoke_method(method, instance, args)
+}
+
+// ── Metadata-backend vtable shims for `Iter<FieldInfo> / Iter<MethodPtr>` ────
+//
+// These wire the agent-side il2cpp walk (config offsets, tc decoding, klass
+// back-pointer sentinel) into `agent_core::spine::metadata_backend` so the
+// trait `Iter` impls on `KlassPtr` (defined in agent-core, where the orphan
+// rule forces them) can call back into agent-side memory primitives.
+//
+// Contract: each call MUST advance internally past any garbage entries and
+// return the next REAL record at-or-after `cursor`. The iterator on the
+// agent-core side bumps cursor by one after each Some return — duplicate
+// records or out-of-order returns will mis-iterate. End-of-array is signalled
+// by `None`.
+
+/// `metadata_backend::FieldsFn` impl. Mirrors `for_each_field`'s validation
+/// logic exactly: token != 0, type_ptr decodes to a tc in 1..=0x45,
+/// value-type offset adjustment. Skips garbage internally and returns the
+/// physical slot just past the yielded record in `next_cursor` so the
+/// agent-core iterator resumes from the right spot on its next call.
+fn fields_at(klass: usize, cursor: usize) -> Option<agent_core::spine::metadata_backend::FieldInfoRaw> {
+    let c = ctx::get()?;
+    let fields_ptr = match cache::read_u64(klass + c.cfg.klass_fields) {
+        Some(p) if p != 0 => p as usize,
+        _ => return None,
+    };
+    let is_vt = klass_is_valuetype(klass as u64);
+    let mut fi = cursor;
+    while fi < 256 {
+        let slot = fields_ptr + fi * 32;
+        let name_ptr = match cache::read_u64(slot) {
+            Some(p) if p != 0 => p as usize,
+            _ => return None, // real end-of-array sentinel
+        };
+        let this_slot = fi;
+        fi += 1;
+        // Skip garbage that the legacy walk filters (without ending iteration).
+        if cache::read_cstr(name_ptr).map_or(true, |n| n.is_empty()) {
+            continue;
+        }
+        let token = cache::read_u32(slot + 28).unwrap_or(0);
+        if token == 0 {
+            continue; // scanner garbage: real fields always have a metadata token
+        }
+        let type_ptr = cache::read_u64(slot + 8).unwrap_or(0) as usize;
+        if type_ptr == 0 {
+            continue;
+        }
+        let chunk = cache::read_u64(type_ptr + c.cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
+        let tc = ((chunk >> c.cfg.discrim_shift) & 0xFF) as u8;
+        if tc == 0 || tc > 0x45 {
+            continue;
+        }
+        let raw_offset = cache::read_u32(slot + 24).unwrap_or(0);
+        let offset = if is_vt {
+            raw_offset.saturating_sub(0x10)
+        } else {
+            raw_offset
+        };
+        let vt = valtype_from_tc(tc).unwrap_or(ValType::U64);
+        return Some(agent_core::spine::metadata_backend::FieldInfoRaw {
+            name_ptr,
+            offset,
+            val_type: vt,
+            token,
+            next_cursor: this_slot + 1,
+        });
+    }
+    None
+}
+
+/// `metadata_backend::MethodsFn` impl. Mirrors `find_method`'s end-of-array
+/// detection: the klass back-pointer must match. The methods array is dense
+/// (no garbage to skip), so cursor maps 1-to-1 to array index.
+fn methods_at(klass: usize, cursor: usize) -> Option<u64> {
+    let c = ctx::get()?;
+    let methods = cache::read_u64(klass + c.cfg.klass_methods).unwrap_or(0) as usize;
+    if methods == 0 {
+        return None;
+    }
+    let mi = match cache::read_u64(methods + cursor * 8) {
+        Some(v) if v != 0 => v as usize,
+        _ => return None,
+    };
+    // Array-end / validity: the MethodInfo's declaring-klass must be this klass.
+    if cache::read_u64(mi + c.cfg.method_klass_off).unwrap_or(0) != klass as u64 {
+        return None;
+    }
+    Some(mi as u64)
+}
+
+/// Register the metadata-walk shims with agent_core's metadata_backend vtable.
+/// Call once at agent start, after `ctx::init` (the shims read `ctx::get()`).
+pub fn register_metadata_backend() {
+    agent_core::spine::metadata_backend::register(fields_at, methods_at);
 }

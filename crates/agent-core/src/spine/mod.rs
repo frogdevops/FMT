@@ -5,12 +5,18 @@
 
 pub mod addr;
 pub mod error;
+pub mod field_info;
 pub mod handles;
 pub mod invoke_arg;
 pub mod value;
+pub mod access;
+pub mod mem_backend;
+pub mod metadata_backend;
 
 pub use addr::{MemAddr, ReadOnly, ReadWrite};
 pub use error::{HookError, InvokeError, MemError};
-pub use handles::{FrameSeq, HookHandle, Instance, KlassPtr, MethodPtr, SocketHandle};
+pub use field_info::FieldInfo;
+pub use handles::{FieldAddr, FrameSeq, HookHandle, Instance, KlassPtr, MethodPtr, SocketHandle};
 pub use invoke_arg::InvokeArg;
 pub use value::MemValue;
+pub use access::{Iter, Read, Write};

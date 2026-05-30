@@ -242,8 +242,8 @@ impl Il2CppConfig {
         apply_offset_phase2(&mut cfg.method_name_off, &mn);
         apply_offset_phase2(&mut cfg.method_klass_off, &mk);
         apply_offset_phase2(&mut cfg.method_flags_off, &mf);
-        apply_offset(&mut cfg.method_parameters_off, &mpars);     // loose probe; keep strict gate
-        apply_offset(&mut cfg.method_return_type_off, &mret);     // loose probe; keep strict gate
+        apply_offset_phase2(&mut cfg.method_parameters_off, &mpars);  // strengthened probe; safe with relaxed gate
+        apply_offset_phase2(&mut cfg.method_return_type_off, &mret);  // strengthened probe; safe with relaxed gate
         apply_offset_phase2(&mut cfg.method_param_count_off, &mpc);
         let phase2 = vec![mp, mn, mk, mf, mpars, mret, mpc];
         crate::paths::log("probe: Phase 2 (method) EXIT");

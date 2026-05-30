@@ -23,6 +23,7 @@ pub struct RawFrame {
 
 /// A capacity-bounded FIFO of frames. Pushing past either the frame cap or the
 /// byte cap evicts oldest-first until both fit.
+#[derive(Debug)]
 pub struct FrameRing {
     frames: VecDeque<RawFrame>,
     total_bytes: usize,
@@ -51,10 +52,47 @@ impl FrameRing {
     pub fn is_empty(&self) -> bool { self.frames.is_empty() }
     pub fn total_bytes(&self) -> usize { self.total_bytes }
 
+    /// Return a clone of the frame at `idx` (0 = oldest). Returns `None` if
+    /// `idx >= self.len()`. Clone is cheap for typical small frames; avoids
+    /// exposing the internal `VecDeque` directly.
+    pub fn get(&self, idx: usize) -> Option<RawFrame> {
+        self.frames.get(idx).cloned()
+    }
+
     /// Remove and return all frames in FIFO order (for the TCP consumer).
     pub fn drain(&mut self) -> Vec<RawFrame> {
         self.total_bytes = 0;
         self.frames.drain(..).collect()
+    }
+}
+
+// ── Iter trait impl — lazy walk over the bounded ring ───────────────────────
+
+use crate::spine::Iter;
+
+/// Lightweight iterator state for `Iter<RawFrame> for &'a FrameRing`.
+/// Walks from oldest to newest without consuming the ring.
+#[derive(Debug)]
+pub struct FrameRingIter<'a> {
+    ring:   &'a FrameRing,
+    cursor: usize,
+    limit:  usize,
+}
+
+impl<'a> Iterator for FrameRingIter<'a> {
+    type Item = RawFrame;
+    fn next(&mut self) -> Option<RawFrame> {
+        if self.cursor >= self.limit { return None; }
+        let frame = self.ring.get(self.cursor)?;
+        self.cursor += 1;
+        Some(frame)
+    }
+}
+
+impl<'a> Iter<RawFrame> for &'a FrameRing {
+    type Iter = FrameRingIter<'a>;
+    fn iter(&self) -> Self::Iter {
+        FrameRingIter { ring: self, cursor: 0, limit: self.len() }
     }
 }
 

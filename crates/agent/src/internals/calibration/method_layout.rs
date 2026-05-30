@@ -144,9 +144,32 @@ pub fn probe_method_parameters_off(
     };
     let anchors: Vec<(u64, ())> = vec![(pow, ()), (padleft, ())];
     let candidates = vec![0x28usize, 0x30, 0x38];
+    // Structural validator: the value at `off` must be a ParameterInfo array
+    // whose entries each contain a valid Il2CppType* (tc in 0x01..=0x45). The
+    // method's param_count_off is already probed strongly (u8 == 2 for both
+    // anchors); we walk up to 4 entries.
+    let cfg_fallback = crate::internals::config::Il2CppConfig::fallback_constants();
     let extract = |m: &u64, off: usize| -> Option<()> {
-        let p = map.read_u64(*m as usize + off)?;
-        if p > 0x10000 { Some(()) } else { None }
+        let p = map.read_u64(*m as usize + off)? as usize;
+        if p == 0 { return None; }
+        let count = map.read_u8(*m as usize + cfg_fallback.method_param_count_off)? as usize;
+        if count == 0 { return Some(()); }   // zero-arg method; any non-null ptr OK
+        if count > 32 { return None; }        // structural sanity
+
+        let stride = cfg_fallback.param_info_size;
+        let type_off = cfg_fallback.param_info_type_off;
+        let read_at = cfg_fallback.il2cpp_type_discrim_read_at;
+        let shift = cfg_fallback.discrim_shift;
+
+        for i in 0..count.min(4) {
+            let pi = p + i * stride;
+            let tp = map.read_u64(pi + type_off)? as usize;
+            if tp == 0 { return None; }
+            let chunk = map.read_u64(tp + read_at)?;
+            let tc = ((chunk >> shift) & 0xFF) as u8;
+            if !(0x01..=0x45).contains(&tc) { return None; }
+        }
+        Some(())
     };
     let result = pick_offset_by_consensus(&candidates, &anchors, extract, MIN_RATIO);
     super::klass_layout::finalize_pub("method_parameters_off", result, anchors.len() as u32, candidates)
@@ -166,9 +189,17 @@ pub fn probe_method_return_type_off(
     };
     let anchors: Vec<(u64, ())> = vec![(pow, ()), (padleft, ())];
     let candidates = vec![0x20usize, 0x28, 0x30];
+    // Structural validator: the value at `off` must be an Il2CppType* whose tc
+    // (via the fallback discriminator recipe — proven stable v24→v31) is in
+    // the valid il2cpp type-code range 0x01..=0x45.
+    let cfg_fallback = crate::internals::config::Il2CppConfig::fallback_constants();
     let extract = |m: &u64, off: usize| -> Option<()> {
-        let p = map.read_u64(*m as usize + off)?;
-        if p > 0x10000 { Some(()) } else { None }
+        let p = map.read_u64(*m as usize + off)? as usize;
+        if p == 0 { return None; }
+        let chunk = map.read_u64(p + cfg_fallback.il2cpp_type_discrim_read_at)?;
+        let tc = ((chunk >> cfg_fallback.discrim_shift) & 0xFF) as u8;
+        if !(0x01..=0x45).contains(&tc) { return None; }
+        Some(())
     };
     let result = pick_offset_by_consensus(&candidates, &anchors, extract, MIN_RATIO);
     super::klass_layout::finalize_pub("method_return_type_off", result, anchors.len() as u32, candidates)

@@ -164,6 +164,9 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     }
 
     crate::external::cache::start_refresher();
+    // Register Windows-backed read/write ops with agent_core's mem_backend
+    // vtable so Read<T>/Write<T> trait methods work on MemAddr/FieldAddr.
+    crate::external::api::register_mem_backend();
 
     crate::internals::ctx::init(crate::internals::ctx::InternalsCtx {
         table_base,
@@ -171,6 +174,12 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         api: api.clone(),
         cfg: cfg.clone(),
     });
+
+    // Register il2cpp-metadata walk shims with agent_core's metadata_backend
+    // vtable so `Iter<FieldInfo>` / `Iter<MethodPtr>` impls on `KlassPtr`
+    // (defined in agent-core for orphan-rule reasons) can call back into the
+    // agent-side walk logic. Must follow `ctx::init` — the shims read it.
+    crate::internals::api::register_metadata_backend();
 
     // Klass probe must run AFTER ctx::init() so find_class() has a valid context.
     if std::env::var("FROG_KLASS_PROBE").is_ok() {
