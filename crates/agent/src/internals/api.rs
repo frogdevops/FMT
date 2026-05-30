@@ -5,27 +5,31 @@
 use std::ffi::c_void;
 
 use agent_core::mem_value::{status, valtype_from_tc, ValType, Value};
+use agent_core::spine::{KlassPtr, MethodPtr, Instance, FieldAddr, MemAddr, ReadOnly, ReadWrite, InvokeArg, InvokeError};
 
 use crate::external::{api as ext, cache};
 use crate::internals::ctx;
-use crate::internals::ffi::{cstr_to_string, FieldInfo, Il2CppClass};
+use crate::internals::ffi::{cstr_to_string, Il2CppClass};
 
 /// Search the live class table for a class whose name (or "Namespace::Name")
-/// matches `name`. Returns the klass ptr, or 0.
-pub fn find_class(name: &str) -> u64 {
-    let c = match ctx::get() { Some(c) => c, None => return 0 };
+/// matches `name`. Returns `Some(KlassPtr)` when found, `None` otherwise.
+pub fn find_class(name: &str) -> Option<KlassPtr> {
+    let c = ctx::get()?;
     for i in 0..c.table_count {
         let slot = c.table_base.wrapping_add(i * c.cfg.class_table_step);
-        let klass = match cache::read_u64(slot) { Some(k) if k != 0 => k as usize, _ => continue };
+        let klass = match cache::read_u64(slot) {
+            Some(k) if k != 0 => k as usize,
+            _ => continue,
+        };
         if !cache::is_klass_shape(klass) { continue; }
         let cn = unsafe { cstr_to_string((c.api.class_get_name)(klass as *mut Il2CppClass)) };
         if cn.is_empty() { continue; }
-        if cn == name { return klass as u64; }
+        if cn == name { return Some(KlassPtr::from_raw(klass as u64)); }
         let ns = unsafe { cstr_to_string((c.api.class_get_namespace)(klass as *mut Il2CppClass)) };
         let full = if ns.is_empty() { cn } else { format!("{}::{}", ns, cn) };
-        if full == name { return klass as u64; }
+        if full == name { return Some(KlassPtr::from_raw(klass as u64)); }
     }
-    0
+    None
 }
 
 /// Walk a klass's FieldInfo array, invoking `f(name, offset, type_ptr)` per field.
@@ -85,9 +89,9 @@ fn type_tc(type_ptr: usize) -> u8 {
 }
 
 /// Field offset + external ValType for `name`, or None. The composition bridge.
-pub fn field_info(klass: u64, name: &str) -> Option<(u32, ValType)> {
+pub fn field_info(klass: KlassPtr, name: &str) -> Option<(u32, ValType)> {
     let mut found = None;
-    for_each_field(klass as usize, |fname, offset, type_ptr| {
+    for_each_field(klass.as_u64() as usize, |fname, offset, type_ptr| {
         if fname == name {
             let vt = valtype_from_tc(type_tc(type_ptr)).unwrap_or(ValType::U64);
             found = Some((offset, vt));
@@ -100,51 +104,72 @@ pub fn field_info(klass: u64, name: &str) -> Option<(u32, ValType)> {
 }
 
 /// Read a field by name through external's validated read. The native read.
-pub fn get_field(instance: u64, klass: u64, name: &str) -> Result<Value, i32> {
+pub fn get_field(instance: Instance, klass: KlassPtr, name: &str) -> Result<Value, i32> {
     let (offset, vt) = field_info(klass, name).ok_or(status::ERR_BAD_TYPE)?;
-    let addr = (instance as usize).wrapping_add(offset as usize);
-    ext::read(addr, vt, vt.fixed_width().unwrap_or(8))
+    let addr_raw = (instance.as_u64() as usize).wrapping_add(offset as usize) as u64;
+    let addr = MemAddr::<ReadOnly>::from_raw(addr_raw);
+    let val = match vt {
+        ValType::U8  => Value::U8 (ext::read::<u8 , _>(addr).map_err(i32::from)?),
+        ValType::U16 => Value::U16(ext::read::<u16, _>(addr).map_err(i32::from)?),
+        ValType::U32 => Value::U32(ext::read::<u32, _>(addr).map_err(i32::from)?),
+        ValType::U64 => Value::U64(ext::read::<u64, _>(addr).map_err(i32::from)?),
+        ValType::I8  => Value::I8 (ext::read::<i8 , _>(addr).map_err(i32::from)?),
+        ValType::I16 => Value::I16(ext::read::<i16, _>(addr).map_err(i32::from)?),
+        ValType::I32 => Value::I32(ext::read::<i32, _>(addr).map_err(i32::from)?),
+        ValType::I64 => Value::I64(ext::read::<i64, _>(addr).map_err(i32::from)?),
+        ValType::F32 => Value::F32(ext::read::<f32, _>(addr).map_err(i32::from)?),
+        ValType::F64 => Value::F64(ext::read::<f64, _>(addr).map_err(i32::from)?),
+        ValType::Bytes | ValType::Cstr => return Err(status::ERR_BAD_TYPE),
+    };
+    Ok(val)
 }
 
-/// The klass pointer at an object's head ("what is this object?"). 0 = unreadable.
-pub fn klass_of(instance: u64) -> u64 {
-    cache::read_u64(instance as usize).unwrap_or(0)
+/// The klass pointer at an object's head ("what is this object?"). Returns
+/// `None` if the instance head is unreadable or zero.
+pub fn klass_of(instance: Instance) -> Option<KlassPtr> {
+    match cache::read_u64(instance.as_u64() as usize) {
+        Some(k) if k != 0 => Some(KlassPtr::from_raw(k)),
+        _ => None,
+    }
 }
 
-/// Address of a static field by name (no instance needed). 0 = not found / not static.
-/// static base = klass + klass_static_fields; a field is static iff its type-attrs
-/// (low 16 bits of the discriminator chunk) have FIELD_ATTRIBUTE_STATIC (0x10).
-pub fn static_field(klass: u64, name: &str) -> u64 {
-    let c = match ctx::get() { Some(c) => c, None => return 0 };
-    let k = klass as usize;
+/// Address of a static field by name. Returns `Some(MemAddr<ReadWrite>)` when
+/// found AND the field is actually static, `None` otherwise. Statics are
+/// writable by intent.
+pub fn static_field(klass: KlassPtr, name: &str) -> Option<MemAddr<ReadWrite>> {
+    let c = ctx::get()?;
+    let k = klass.as_u64() as usize;
     let static_base = cache::read_u64(k + c.cfg.klass_static_fields).unwrap_or(0);
     if static_base == 0 {
-        return 0;
+        return None;
     }
-    let mut addr = 0u64;
+    let mut addr_out: Option<MemAddr<ReadWrite>> = None;
     for_each_field(k, |fname, offset, type_ptr| {
         if fname == name {
             let chunk = cache::read_u64(type_ptr + c.cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
             if chunk & 0x10 != 0 {
-                addr = static_base + offset as u64;
+                let raw = static_base + offset as u64;
+                // SAFETY: static_base lives in a writable region; the static-attr
+                // bit confirms this field address is in that region.
+                addr_out = Some(unsafe { MemAddr::<ReadWrite>::from_raw_writable(raw) });
             }
             true
         } else {
             false
         }
     });
-    addr
+    addr_out
 }
 
-/// Locate a method by name + arg count → MethodInfo* (the handle), or 0.
-/// Walks the klass's methods array (klass + klass_methods); stops at the array end
-/// when an entry's klass back-pointer no longer matches (no method_count needed).
-pub fn find_method(klass: u64, name: &str, argc: u32) -> u64 {
-    let c = match ctx::get() { Some(c) => c, None => return 0 };
-    let k = klass as usize;
+/// Locate a method by name + arg count → `MethodPtr`, or `None`. Walks the
+/// klass's methods array; stops at the array end when an entry's klass back-
+/// pointer no longer matches (no method_count needed).
+pub fn find_method(klass: KlassPtr, name: &str, argc: u32) -> Option<MethodPtr> {
+    let c = ctx::get()?;
+    let k = klass.as_u64() as usize;
     let methods = cache::read_u64(k + c.cfg.klass_methods).unwrap_or(0) as usize;
     if methods == 0 {
-        return 0;
+        return None;
     }
     for i in 0..4096usize {
         let mi = match cache::read_u64(methods + i * 8) {
@@ -152,7 +177,7 @@ pub fn find_method(klass: u64, name: &str, argc: u32) -> u64 {
             _ => break,
         };
         // Array-end / validity: the MethodInfo's declaring-klass must be this klass.
-        if cache::read_u64(mi + c.cfg.method_klass_off).unwrap_or(0) != klass {
+        if cache::read_u64(mi + c.cfg.method_klass_off).unwrap_or(0) != klass.as_u64() {
             break;
         }
         let name_ptr = cache::read_u64(mi + c.cfg.method_name_off).unwrap_or(0) as usize;
@@ -162,10 +187,10 @@ pub fn find_method(klass: u64, name: &str, argc: u32) -> u64 {
         };
         let pcount = cache::read_u8(mi + c.cfg.method_param_count_off).unwrap_or(0) as u32;
         if mname == name && pcount == argc {
-            return mi as u64;
+            return Some(MethodPtr::from_raw(mi as u64));
         }
     }
-    0
+    None
 }
 
 /// True if the klass is a value type. Reads `Il2CppClass.byval_arg`'s valuetype
@@ -188,77 +213,32 @@ pub fn klass_is_valuetype_via_map(
     byte & cfg.klass_valuetype_bit != 0
 }
 
-/// Typed sibling of `find_class`. Returns `Some(KlassPtr)` when found, `None`
-/// otherwise. Uses the spine vocabulary; raw `find_class` remains for the
-/// existing WASM-host call site.
-pub fn find_class_t(name: &str) -> Option<agent_core::spine::KlassPtr> {
-    match find_class(name) {
-        0 => None,
-        k => Some(agent_core::spine::KlassPtr::from_raw(k)),
-    }
-}
-
-/// Typed sibling of `find_method`. Returns `Some(MethodPtr)` when found.
-pub fn find_method_t(
-    klass: agent_core::spine::KlassPtr,
-    name: &str,
-    argc: u32,
-) -> Option<agent_core::spine::MethodPtr> {
-    match find_method(klass.as_u64(), name, argc) {
-        0 => None,
-        m => Some(agent_core::spine::MethodPtr::from_raw(m)),
-    }
-}
-
 /// Typed address of an instance field: `instance + field_info(klass, name).offset`.
 /// Returns a `FieldAddr` carrying both the writable raw address and the
 /// decoded `ValType` so downstream `Write<T>` calls can enforce type-match.
 /// Returns `None` if the field is not found on the class.
-pub fn field_addr_t(
-    klass: agent_core::spine::KlassPtr,
+///
+/// Load-bearing typed-API surface (no caller today; future composers consume it).
+#[allow(dead_code)]
+pub fn field_addr(
+    klass: KlassPtr,
     name: &str,
-    instance: agent_core::spine::Instance,
-) -> Option<agent_core::spine::FieldAddr> {
-    let (offset, vt) = field_info(klass.as_u64(), name)?;
+    instance: Instance,
+) -> Option<FieldAddr> {
+    let (offset, vt) = field_info(klass, name)?;
     let addr_raw = (instance.as_u64() as usize).wrapping_add(offset as usize) as u64;
     // SAFETY: caller obtained `instance` via the spine API; instance fields
     // are writable by their semantic role.
-    let addr = unsafe { agent_core::spine::MemAddr::from_raw_writable(addr_raw) };
-    Some(agent_core::spine::FieldAddr::new(addr, vt))
-}
-
-/// Typed address of a static field. Returns `MemAddr<ReadWrite>` — statics
-/// are writable by intent. Returns `None` if the field is not found or not
-/// actually static on this class.
-pub fn static_field_t(
-    klass: agent_core::spine::KlassPtr,
-    name: &str,
-) -> Option<agent_core::spine::MemAddr<agent_core::spine::ReadWrite>> {
-    match static_field(klass.as_u64(), name) {
-        0 => None,
-        // SAFETY: static_field returns 0 unless the field is actually marked
-        // FIELD_ATTRIBUTE_STATIC; the static base lives in a writable region.
-        a => Some(unsafe { agent_core::spine::MemAddr::from_raw_writable(a) }),
-    }
-}
-
-/// Typed sibling of `klass_of`. Returns `None` if the instance head is
-/// unreadable or zero.
-pub fn klass_of_t(
-    instance: agent_core::spine::Instance,
-) -> Option<agent_core::spine::KlassPtr> {
-    match klass_of(instance.as_u64()) {
-        0 => None,
-        k => Some(agent_core::spine::KlassPtr::from_raw(k)),
-    }
+    let addr = unsafe { MemAddr::from_raw_writable(addr_raw) };
+    Some(FieldAddr::new(addr, vt))
 }
 
 /// Typed sibling: invoke a managed method with the spine vocabulary.
-pub fn invoke_method_t(
-    method: agent_core::spine::MethodPtr,
-    instance: Option<agent_core::spine::Instance>,
-    args: &[agent_core::spine::InvokeArg],
-) -> Result<agent_core::spine::InvokeArg, agent_core::spine::InvokeError> {
+pub fn invoke_method(
+    method: MethodPtr,
+    instance: Option<Instance>,
+    args: &[InvokeArg],
+) -> Result<InvokeArg, InvokeError> {
     crate::internals::marshal::invoke_method(method, instance, args)
 }
 

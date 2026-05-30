@@ -5,7 +5,8 @@
 
 use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 
-use agent_core::mem_value::{status, ValType, Value};
+use agent_core::mem_value::{status, ValType};
+use agent_core::spine::{MemAddr, MemValue, ReadOnly, ReadWrite};
 use agent_core::wasm::WasmError;
 
 use crate::external::api;
@@ -34,6 +35,83 @@ fn write_guest(caller: &mut Caller<'_, HostState>, ptr: i32, bytes: &[u8]) -> bo
     }
 }
 
+/// Dispatch a typed read of `T` from `addr` and write the little-endian bytes
+/// into the guest's `out_ptr` buffer. Returns the number of bytes written, or
+/// a negative status code.
+fn host_read_typed<T: MemValue>(
+    caller: &mut Caller<'_, HostState>,
+    addr: MemAddr<ReadOnly>,
+    out_ptr: i32,
+    out_cap: i32,
+) -> i32 {
+    match api::read::<T, _>(addr) {
+        Ok(v) => {
+            let bytes = v.to_le_bytes_buf();
+            if bytes.len() > out_cap.max(0) as usize {
+                return status::ERR_BUF_TOO_SMALL;
+            }
+            if !write_guest(caller, out_ptr, &bytes) {
+                return status::ERR_BUF_TOO_SMALL;
+            }
+            bytes.len() as i32
+        }
+        Err(e) => i32::from(e),
+    }
+}
+
+/// Dispatch a typed write of `T` from the guest's `in_ptr`+`in_len` buffer to
+/// `addr`. Returns OK or a negative status code.
+fn host_write_typed<T: MemValue>(
+    caller: &Caller<'_, HostState>,
+    addr: MemAddr<ReadWrite>,
+    in_ptr: i32,
+    in_len: i32,
+) -> i32 {
+    let bytes = match read_guest(caller, in_ptr, in_len) {
+        Some(b) => b,
+        None => return status::ERR_BAD_TYPE,
+    };
+    let val = match T::from_le_bytes_spine(&bytes) {
+        Some(v) => v,
+        None => return status::ERR_BAD_TYPE,
+    };
+    match api::write::<T>(addr, val) {
+        Ok(()) => status::OK,
+        Err(e) => i32::from(e),
+    }
+}
+
+/// Typed compare-and-write: read current `T` at `addr`, compare to `exp_bytes`,
+/// write `new_bytes` only on match. Returns OK on write, CHANGED on mismatch,
+/// or a negative status code on read/write failure. Not atomic — read+compare+
+/// write under the cache mutex but no CPU CAS primitive.
+fn host_write_if_typed<T: MemValue + PartialEq>(
+    _caller: &Caller<'_, HostState>,
+    addr: MemAddr<ReadWrite>,
+    exp_bytes: &[u8],
+    new_bytes: &[u8],
+) -> i32 {
+    let exp = match T::from_le_bytes_spine(exp_bytes) {
+        Some(v) => v,
+        None => return status::ERR_BAD_TYPE,
+    };
+    let new = match T::from_le_bytes_spine(new_bytes) {
+        Some(v) => v,
+        None => return status::ERR_BAD_TYPE,
+    };
+    let cur: T = match api::read::<T, _>(addr.as_readonly()) {
+        Ok(v) => v,
+        Err(e) => return i32::from(e),
+    };
+    if cur != exp {
+        return status::CHANGED;
+    }
+    match api::write::<T>(addr, new) {
+        Ok(()) => status::OK,
+        Err(e) => i32::from(e),
+    }
+}
+
 fn host_log(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) {
     if let Some(bytes) = read_guest(&caller, ptr, len) {
         caller.data_mut().logs.push(String::from_utf8_lossy(&bytes).into_owned());
@@ -42,11 +120,36 @@ fn host_log(mut caller: Caller<'_, HostState>, ptr: i32, len: i32) {
 
 fn host_read(mut caller: Caller<'_, HostState>, addr: i64, ty: i32, len: i32, out_ptr: i32, out_cap: i32) -> i32 {
     let ty = match ValType::from_tag(ty as u8) { Some(t) => t, None => return status::ERR_BAD_TYPE };
-    let value = match api::read(addr as usize, ty, len.max(0) as usize) { Ok(v) => v, Err(c) => return c };
-    let bytes = value.encode();
-    if bytes.len() > out_cap.max(0) as usize { return status::ERR_BUF_TOO_SMALL; }
-    if !write_guest(&mut caller, out_ptr, &bytes) { return status::ERR_BUF_TOO_SMALL; }
-    bytes.len() as i32
+    let addr = MemAddr::<ReadOnly>::from_raw(addr as u64);
+    match ty {
+        ValType::U8  => host_read_typed::<u8 >(&mut caller, addr, out_ptr, out_cap),
+        ValType::U16 => host_read_typed::<u16>(&mut caller, addr, out_ptr, out_cap),
+        ValType::U32 => host_read_typed::<u32>(&mut caller, addr, out_ptr, out_cap),
+        ValType::U64 => host_read_typed::<u64>(&mut caller, addr, out_ptr, out_cap),
+        ValType::I8  => host_read_typed::<i8 >(&mut caller, addr, out_ptr, out_cap),
+        ValType::I16 => host_read_typed::<i16>(&mut caller, addr, out_ptr, out_cap),
+        ValType::I32 => host_read_typed::<i32>(&mut caller, addr, out_ptr, out_cap),
+        ValType::I64 => host_read_typed::<i64>(&mut caller, addr, out_ptr, out_cap),
+        ValType::F32 => host_read_typed::<f32>(&mut caller, addr, out_ptr, out_cap),
+        ValType::F64 => host_read_typed::<f64>(&mut caller, addr, out_ptr, out_cap),
+        ValType::Bytes => match api::read_bytes(addr, len.max(0) as usize) {
+            Ok(bytes) => {
+                if bytes.len() > out_cap.max(0) as usize { return status::ERR_BUF_TOO_SMALL; }
+                if !write_guest(&mut caller, out_ptr, &bytes) { return status::ERR_BUF_TOO_SMALL; }
+                bytes.len() as i32
+            }
+            Err(e) => i32::from(e),
+        },
+        ValType::Cstr => match api::read_cstr(addr, len.max(0) as usize) {
+            Ok(s) => {
+                let bytes = s.into_bytes();
+                if bytes.len() > out_cap.max(0) as usize { return status::ERR_BUF_TOO_SMALL; }
+                if !write_guest(&mut caller, out_ptr, &bytes) { return status::ERR_BUF_TOO_SMALL; }
+                bytes.len() as i32
+            }
+            Err(e) => i32::from(e),
+        },
+    }
 }
 
 fn host_scan(mut caller: Caller<'_, HostState>, pat_ptr: i32, pat_len: i32, out_ptr: i32, out_cap_count: i32) -> i32 {
@@ -73,33 +176,63 @@ fn host_regions(mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap_count: 
 
 fn host_write(caller: Caller<'_, HostState>, addr: i64, ty: i32, in_ptr: i32, in_len: i32) -> i32 {
     let ty = match ValType::from_tag(ty as u8) { Some(t) => t, None => return status::ERR_BAD_TYPE };
-    let bytes = match read_guest(&caller, in_ptr, in_len) { Some(b) => b, None => return status::ERR_BAD_TYPE };
-    let value = match Value::decode(ty, &bytes) { Some(v) => v, None => return status::ERR_BAD_TYPE };
-    match api::write(addr as usize, &value) { Ok(()) => status::OK, Err(c) => c }
+    // SAFETY: writes are gated by `write_granted` at linker registration; reaching
+    // host_write means the script declared write intent. The typed-write helper
+    // delegates to api::write which calls the cache-validated backend.
+    let addr = unsafe { MemAddr::<ReadWrite>::from_raw_writable(addr as u64) };
+    match ty {
+        ValType::U8  => host_write_typed::<u8 >(&caller, addr, in_ptr, in_len),
+        ValType::U16 => host_write_typed::<u16>(&caller, addr, in_ptr, in_len),
+        ValType::U32 => host_write_typed::<u32>(&caller, addr, in_ptr, in_len),
+        ValType::U64 => host_write_typed::<u64>(&caller, addr, in_ptr, in_len),
+        ValType::I8  => host_write_typed::<i8 >(&caller, addr, in_ptr, in_len),
+        ValType::I16 => host_write_typed::<i16>(&caller, addr, in_ptr, in_len),
+        ValType::I32 => host_write_typed::<i32>(&caller, addr, in_ptr, in_len),
+        ValType::I64 => host_write_typed::<i64>(&caller, addr, in_ptr, in_len),
+        ValType::F32 => host_write_typed::<f32>(&caller, addr, in_ptr, in_len),
+        ValType::F64 => host_write_typed::<f64>(&caller, addr, in_ptr, in_len),
+        // Variable-length writes are not supported through this host fn; the
+        // raw `api::write` path did not support them either (it returned
+        // ERR_BAD_TYPE on empty bytes). Preserve that semantic:
+        ValType::Bytes | ValType::Cstr => status::ERR_BAD_TYPE,
+    }
 }
 
 fn host_write_if(caller: Caller<'_, HostState>, addr: i64, ty: i32, exp_ptr: i32, exp_len: i32, new_ptr: i32, new_len: i32) -> i32 {
     let ty = match ValType::from_tag(ty as u8) { Some(t) => t, None => return status::ERR_BAD_TYPE };
     let exp_b = match read_guest(&caller, exp_ptr, exp_len) { Some(b) => b, None => return status::ERR_BAD_TYPE };
     let new_b = match read_guest(&caller, new_ptr, new_len) { Some(b) => b, None => return status::ERR_BAD_TYPE };
-    let (exp, new) = match (Value::decode(ty, &exp_b), Value::decode(ty, &new_b)) {
-        (Some(a), Some(b)) => (a, b), _ => return status::ERR_BAD_TYPE,
-    };
-    match api::write_if(addr as usize, &exp, &new) {
-        Ok(true) => status::OK, Ok(false) => status::CHANGED, Err(c) => c,
+    // SAFETY: write_if is gated by write_granted at linker registration; reaching
+    // host_write_if means the script declared write intent.
+    let addr = unsafe { MemAddr::<ReadWrite>::from_raw_writable(addr as u64) };
+    match ty {
+        ValType::U8  => host_write_if_typed::<u8 >(&caller, addr, &exp_b, &new_b),
+        ValType::U16 => host_write_if_typed::<u16>(&caller, addr, &exp_b, &new_b),
+        ValType::U32 => host_write_if_typed::<u32>(&caller, addr, &exp_b, &new_b),
+        ValType::U64 => host_write_if_typed::<u64>(&caller, addr, &exp_b, &new_b),
+        ValType::I8  => host_write_if_typed::<i8 >(&caller, addr, &exp_b, &new_b),
+        ValType::I16 => host_write_if_typed::<i16>(&caller, addr, &exp_b, &new_b),
+        ValType::I32 => host_write_if_typed::<i32>(&caller, addr, &exp_b, &new_b),
+        ValType::I64 => host_write_if_typed::<i64>(&caller, addr, &exp_b, &new_b),
+        ValType::F32 => host_write_if_typed::<f32>(&caller, addr, &exp_b, &new_b),
+        ValType::F64 => host_write_if_typed::<f64>(&caller, addr, &exp_b, &new_b),
+        ValType::Bytes | ValType::Cstr => status::ERR_BAD_TYPE,
     }
 }
 
 fn host_find_class(caller: Caller<'_, HostState>, name_ptr: i32, name_len: i32) -> i64 {
     let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return 0 };
     let name = String::from_utf8_lossy(&name);
-    crate::internals::api::find_class(&name) as i64
+    crate::internals::api::find_class(&name)
+        .map(|k| k.as_u64() as i64)
+        .unwrap_or(0)
 }
 
 fn host_field_info(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, name_len: i32) -> i64 {
     let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return -1 };
     let name = String::from_utf8_lossy(&name);
-    match crate::internals::api::field_info(klass as u64, &name) {
+    let klass = agent_core::spine::KlassPtr::from_raw(klass as u64);
+    match crate::internals::api::field_info(klass, &name) {
         Some((offset, vt)) => ((vt as u8 as i64) << 32) | (offset as i64),
         None => -1,
     }
@@ -111,7 +244,9 @@ fn host_get_field(mut caller: Caller<'_, HostState>, instance: i64, klass: i64, 
         None => return agent_core::mem_value::status::ERR_BAD_TYPE,
     };
     let name = String::from_utf8_lossy(&name).into_owned();
-    let value = match crate::internals::api::get_field(instance as u64, klass as u64, &name) {
+    let instance = agent_core::spine::Instance::from_raw(instance as u64);
+    let klass = agent_core::spine::KlassPtr::from_raw(klass as u64);
+    let value = match crate::internals::api::get_field(instance, klass, &name) {
         Ok(v) => v,
         Err(c) => return c,
     };
@@ -126,17 +261,26 @@ fn host_get_field(mut caller: Caller<'_, HostState>, instance: i64, klass: i64, 
 }
 
 fn host_klass_of(_caller: Caller<'_, HostState>, instance: i64) -> i64 {
-    crate::internals::api::klass_of(instance as u64) as i64
+    let instance = agent_core::spine::Instance::from_raw(instance as u64);
+    crate::internals::api::klass_of(instance)
+        .map(|k| k.as_u64() as i64)
+        .unwrap_or(0)
 }
 
 fn host_static_field(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, name_len: i32) -> i64 {
     let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return 0 };
-    crate::internals::api::static_field(klass as u64, &String::from_utf8_lossy(&name)) as i64
+    let klass = agent_core::spine::KlassPtr::from_raw(klass as u64);
+    crate::internals::api::static_field(klass, &String::from_utf8_lossy(&name))
+        .map(|a| a.as_u64() as i64)
+        .unwrap_or(0)
 }
 
 fn host_find_method(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, name_len: i32, argc: i32) -> i64 {
     let name = match read_guest(&caller, name_ptr, name_len) { Some(b) => b, None => return 0 };
-    crate::internals::api::find_method(klass as u64, &String::from_utf8_lossy(&name), argc.max(0) as u32) as i64
+    let klass = agent_core::spine::KlassPtr::from_raw(klass as u64);
+    crate::internals::api::find_method(klass, &String::from_utf8_lossy(&name), argc.max(0) as u32)
+        .map(|m| m.as_u64() as i64)
+        .unwrap_or(0)
 }
 
 fn host_install_hook(
@@ -236,7 +380,7 @@ fn host_invoke(mut caller: Caller<'_, HostState>, method_ptr: i64, instance_ptr:
     }
 
     // Call the typed core.
-    match crate::internals::api::invoke_method_t(method, instance, &args) {
+    match crate::internals::api::invoke_method(method, instance, &args) {
         Ok(ret_val) => {
             let encoded = ret_val.encode();
             if encoded.len() > out_cap.max(0) as usize {

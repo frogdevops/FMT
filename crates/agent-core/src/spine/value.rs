@@ -10,7 +10,7 @@ use crate::mem_value::ValType;
 ///
 /// Variable-length values (`Bytes`, `Cstr`) are not `MemValue` impls — they
 /// need a length argument that the trait shape can't carry. They live as free
-/// functions on the agent side (`read_bytes_t`, `read_cstr_t`).
+/// functions on the agent side (`read_bytes`, `read_cstr`).
 pub trait MemValue: Sized + Copy {
     const VAL_TYPE: ValType;
 

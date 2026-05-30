@@ -33,7 +33,7 @@ use crate::spine::addr::{MemAddr, ReadWrite};
 /// An il2cpp instance-field address with its known type. Distinct from
 /// `MemAddr<ReadWrite>` because il2cpp field writes may need value-type
 /// boxing semantics that raw memory writes don't. The type system carries
-/// the field's `ValType` from `field_addr_t` construction through any
+/// the field's `ValType` from `field_addr` construction through any
 /// downstream `Write<T>` callsite, where `Write<T> for FieldAddr` can
 /// verify `T::VAL_TYPE == self.val_type` at write time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

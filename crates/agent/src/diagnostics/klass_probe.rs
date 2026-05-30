@@ -76,7 +76,7 @@ fn annotate(v: u64) -> String {
 pub fn run_klass_probe() {
     log("=== KLASS PROBE (FIND-FIRST: methods + static_fields) ===");
     for cname in ["Player", "GameManager", "World", "PlayerData"] {
-        let klass = api::find_class(cname);
+        let klass = api::find_class(cname).map(|k| k.as_u64()).unwrap_or(0);
         if klass == 0 {
             log(&format!("  {} : NOT FOUND", cname));
             continue;
@@ -107,7 +107,7 @@ pub fn run_member_probe() {
         Some(c) => c,
         None => { log("member probe: no internals ctx"); return; }
     };
-    let klass = api::find_class("Player") as usize;
+    let klass = api::find_class("Player").map(|k| k.as_u64() as usize).unwrap_or(0);
     if klass == 0 {
         log("member probe: Player not found");
         return;
