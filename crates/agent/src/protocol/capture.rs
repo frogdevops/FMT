@@ -179,6 +179,25 @@ static PENDING: OnceLock<Mutex<std::collections::HashMap<usize, (u64, usize, u32
     OnceLock::new();
 const MAX_PENDING: usize = 4096;
 
+/// Tracks PENDING-full events (silent capture-degradation signal). One-shot log
+/// on first hit and every 1000 thereafter; process-lifetime cumulative.
+static CAP_HIT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called on every PENDING-full silent drop. Bumps the counter and logs the
+/// first hit + every 1000th hit.
+fn note_pending_cap_hit() {
+    let prev = CAP_HIT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if prev == 0 {
+        crate::paths::log(
+            "⚠ IOCP_CAP_HIT — PENDING map full at MAX_PENDING=4096; capture degraded for new I/O"
+        );
+    } else if (prev + 1) % 1000 == 0 {
+        crate::paths::log(&format!(
+            "⚠ IOCP_CAP_HIT count={} (degraded capture)", prev + 1
+        ));
+    }
+}
+
 fn pending() -> &'static Mutex<std::collections::HashMap<usize, (u64, usize, u32)>> {
     PENDING.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -192,9 +211,10 @@ static ORIG_WSASENDTO:   OnceLock<usize> = OnceLock::new();
 static ORIG_RECV:        OnceLock<usize> = OnceLock::new();
 static ORIG_WSARECV:     OnceLock<usize> = OnceLock::new();
 static ORIG_RECVFROM:    OnceLock<usize> = OnceLock::new();
-static ORIG_WSARECVFROM: OnceLock<usize> = OnceLock::new();
-static ORIG_GQCS:        OnceLock<usize> = OnceLock::new();
-static ORIG_GQCSEX:      OnceLock<usize> = OnceLock::new();
+static ORIG_WSARECVFROM:  OnceLock<usize> = OnceLock::new();
+static ORIG_CLOSESOCKET:  OnceLock<usize> = OnceLock::new();
+static ORIG_GQCS:         OnceLock<usize> = OnceLock::new();
+static ORIG_GQCSEX:       OnceLock<usize> = OnceLock::new();
 
 // ─── WSABUF helper ───────────────────────────────────────────────────────────
 
@@ -405,6 +425,8 @@ unsafe extern "system" fn wsarecv_detour(
                 if let Ok(mut map) = pending().try_lock() {
                     if map.len() < MAX_PENDING {
                         map.insert(lp_overlapped as usize, (s as u64, lp_buffers as usize, dw_buffer_count));
+                    } else {
+                        note_pending_cap_hit();
                     }
                 }
             }
@@ -457,6 +479,8 @@ unsafe extern "system" fn wsarecvfrom_detour(
                 if let Ok(mut map) = pending().try_lock() {
                     if map.len() < MAX_PENDING {
                         map.insert(lp_overlapped as usize, (s as u64, lp_buffers as usize, dw_buffer_count));
+                    } else {
+                        note_pending_cap_hit();
                     }
                 }
             }
@@ -465,6 +489,27 @@ unsafe extern "system" fn wsarecvfrom_detour(
 
     IN_HOOK.with(|h| h.set(false));
     ret
+}
+
+type CloseSocketFn = unsafe extern "system" fn(s: usize) -> i32;
+
+/// closesocket detour: when a socket closes, evict all PENDING entries owned
+/// by it. The GQCS/GQCSEx detours remain the primary cleanup path; this is
+/// the fallback when completion never returns through our hooks (timeouts,
+/// abrupt closes, alternate completion mechanisms).
+unsafe extern "system" fn closesocket_detour(s: usize) -> i32 {
+    // Evict all PENDING entries for this socket.
+    if let Ok(mut map) = pending().try_lock() {
+        let sid = s as u64;
+        map.retain(|_overlapped, &mut (entry_sid, _, _)| entry_sid != sid);
+    }
+    // Delegate to the original closesocket via the trampoline.
+    let tramp = ORIG_CLOSESOCKET.get().copied().unwrap_or(0);
+    if tramp != 0 {
+        let f: CloseSocketFn = std::mem::transmute(tramp);
+        return f(s);
+    }
+    -1
 }
 
 // ─── IOCP completion detours ─────────────────────────────────────────────────
@@ -604,7 +649,8 @@ pub unsafe fn install_packet_hooks() {
     hook_sym!(ws2, b"recv\0",         ORIG_RECV,        recv_detour);
     hook_sym!(ws2, b"WSARecv\0",      ORIG_WSARECV,     wsarecv_detour);
     hook_sym!(ws2, b"recvfrom\0",     ORIG_RECVFROM,    recvfrom_detour);
-    hook_sym!(ws2, b"WSARecvFrom\0",  ORIG_WSARECVFROM, wsarecvfrom_detour);
+    hook_sym!(ws2, b"WSARecvFrom\0",  ORIG_WSARECVFROM,  wsarecvfrom_detour);
+    hook_sym!(ws2, b"closesocket\0",  ORIG_CLOSESOCKET,  closesocket_detour);
     if !kernel32.is_null() {
         hook_sym!(kernel32, b"GetQueuedCompletionStatus\0",   ORIG_GQCS,   gqcs_detour);
         hook_sym!(kernel32, b"GetQueuedCompletionStatusEx\0", ORIG_GQCSEX, gqcsex_detour);

@@ -50,10 +50,18 @@ fn format_class(c: &DumpedClass, fields: &[String]) -> Vec<String> {
 /// metadata-only fields — we print `<?>` so the user sees the hole instead of
 /// silently dropping the field.
 fn field_line(name: &str, type_name: &str, offset: u32, token: u32) -> String {
-    if type_name.is_empty() {
-        format!("    {}: <?> // Offset: {:#x}, Token: {:#x}", name, offset, token)
+    // il2cpp uses 0xffffffff as the "field exists in metadata but runtime
+    // offset not computed" sentinel (e.g. thread_local_static_fields_index).
+    // Display as META so modders see intent rather than what looks like garbage.
+    let offset_str = if offset == 0xffffffff {
+        "META".to_string()
     } else {
-        format!("    {}: {} // Offset: {:#x}, Token: {:#x}", name, type_name, offset, token)
+        format!("{:#x}", offset)
+    };
+    if type_name.is_empty() {
+        format!("    {}: <?> // Offset: {}, Token: {:#x}", name, offset_str, token)
+    } else {
+        format!("    {}: {} // Offset: {}, Token: {:#x}", name, type_name, offset_str, token)
     }
 }
 

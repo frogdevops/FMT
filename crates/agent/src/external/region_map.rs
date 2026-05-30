@@ -119,9 +119,45 @@ impl RegionMap {
         }
     }
 
-    /// NUL-terminated printable-ASCII string (<= 63 chars) at `addr`, or None.
-    /// Bounds-checked via `in_region`; safe to call on any address.
+    /// NUL-terminated string at `addr`, decoded as UTF-8 (lossy on invalid sequences).
+    /// Reads up to 1024 bytes; rejects any control byte (0x01..=0x1F) as a garbage
+    /// signal. Returns `None` if no NUL found in window, the string is empty, or
+    /// the address is out of mapped regions. Bounds-checked via `in_region`.
     pub fn read_name(&self, addr: usize) -> Option<String> {
+        if !self.in_region(addr, 1024) {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, 1024) };
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == 0 {
+                end = Some(i);
+                break;
+            }
+            if b < 0x20 {
+                // control bytes = garbage signal (random binary in low control range)
+                return None;
+            }
+        }
+        let len = end?;
+        if len == 0 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&bytes[..len]).into_owned())
+    }
+
+    /// Structural-predicate variant: NUL-terminated printable-ASCII string
+    /// (`0x20..=0x7E`) up to 63 chars at `addr`. Returns `None` for any byte
+    /// outside printable ASCII OR when no NUL appears within 64 bytes.
+    ///
+    /// USE THIS WHEN: validating unknown memory might be a name (e.g. structural
+    /// scanners walking arbitrary slots, image-shape predicates). The strict
+    /// filter is what makes `find_class_table` discriminate the real class
+    /// table from mscorlib-only or other smaller tables.
+    ///
+    /// Use [`read_name`] (lenient, 1024-byte, UTF-8 lossy) when the pointer is
+    /// already known to come from validated il2cpp metadata.
+    pub fn read_name_strict(&self, addr: usize) -> Option<String> {
         if !self.in_region(addr, 64) {
             return None;
         }
@@ -129,6 +165,9 @@ impl RegionMap {
         let mut s = String::new();
         for &b in bytes {
             if b == 0 {
+                if s.is_empty() {
+                    return None;
+                }
                 return Some(s);
             }
             if !(0x20..=0x7E).contains(&b) {
@@ -148,7 +187,7 @@ impl RegionMap {
             Some(v) => v as usize,
             None => return false,
         };
-        match self.read_name(name_ptr) {
+        match self.read_name_strict(name_ptr) {
             Some(name) => name.len() > 4 && name.ends_with(".dll"),
             None => false,
         }
@@ -163,11 +202,8 @@ impl RegionMap {
         }
         let name_ptr = self.read_u64(p.checked_add(0x10)?)? as usize;
         let ns_ptr = self.read_u64(p.checked_add(0x18)?)? as usize;
-        let name = self.read_name(name_ptr)?;
-        if name.is_empty() {
-            return None;
-        }
-        let ns = self.read_name(ns_ptr)?;
+        let name = self.read_name_strict(name_ptr)?;
+        let ns = self.read_name_strict(ns_ptr).unwrap_or_default();
         Some((name, ns))
     }
 }

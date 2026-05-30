@@ -67,7 +67,7 @@ pub fn probe_klass_namespace(
     let total = anchors.len() as u32;
     let extract = |k: &usize, off: usize| -> Option<String> {
         let ns_ptr = map.read_u64(k + off)? as usize;
-        let s = map.read_name(ns_ptr).unwrap_or_default();
+        let s = map.read_name_strict(ns_ptr).unwrap_or_default();
         if s.is_empty() { None } else { Some(s) }
     };
     match pick_offset_by_consensus(&candidates, &anchors, extract, MIN_RATIO) {
@@ -194,7 +194,7 @@ pub fn probe_klass_fields(
                 if arr == 0 { return None; }
                 let name_ptr = map.read_u64(arr)? as usize;
                 if name_ptr == 0 { return None; }
-                let name = map.read_name(name_ptr)?;
+                let name = map.read_name_strict(name_ptr)?;
                 if name.is_empty() { return None; }
                 let token = map.read_u32(arr + 28)?;
                 if token == 0 { return None; }
@@ -211,7 +211,7 @@ pub fn probe_klass_fields(
         // rejects garbage pointers that happen to point at readable
         // string-like memory (common on obfuscated builds).
         let name_ptr = map.read_u64(arr)? as usize;
-        let name = map.read_name(name_ptr)?;
+        let name = map.read_name_strict(name_ptr)?;
         if name.is_empty() { return None; }
         let token = map.read_u32(arr + 28)?;
         if token == 0 { return None; }

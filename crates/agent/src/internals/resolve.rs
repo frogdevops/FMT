@@ -320,6 +320,7 @@ fn il2cpp_type_name_depth(
                 "<unresolved-class>".into()
             };
         }
+        0x1F => return "System.TypedReference".into(),
         0x1C => return "System.Object".into(),
         0x20 | 0x21 => {
             // CMOD_REQD / CMOD_OPT — wrap an inner Il2CppType. data64 → inner type ptr.
