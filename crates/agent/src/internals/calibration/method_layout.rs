@@ -42,9 +42,14 @@ pub fn probe_method_pointer_off(
     let candidates = vec![0x00usize, 0x08, 0x10];
     let extract = |m: &u64, off: usize| -> Option<()> {
         let p = map.read_u64(*m as usize + off)?;
-        // methodPointer is a code address in 0x6xxxxxxxxxxx range typically;
-        // verify it's not 0 and not in the Unity runtime data region.
-        if p > 0x10_0000_0000 { Some(()) } else { None }
+        if p == 0 { return None; }
+        // methodPointer points to actual function code (RX page). Most other
+        // MethodInfo fields (parameters array, return type, klass back-ptr,
+        // invokerMethod table) are data pointers — RW pages. This is the
+        // structural discriminator: only methodPointer is in an executable
+        // region. No hardcoded address ranges or version assumptions.
+        if !map.is_executable(p as usize) { return None; }
+        Some(())
     };
     let result = pick_offset_by_consensus(&candidates, &anchors, extract, MIN_RATIO);
     super::klass_layout::finalize_pub("method_pointer_off", result, anchors.len() as u32, candidates)

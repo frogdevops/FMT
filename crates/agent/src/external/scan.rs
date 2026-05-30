@@ -76,7 +76,7 @@ pub fn find_class_table() -> Option<(usize, usize)> {
     let map = RegionMap::capture(tunables.max_regions);
 
     let mut merged: Vec<(usize, usize)> = Vec::new();
-    for &(s, e) in map.regions.iter().take(tunables.max_scan_regions) {
+    for &(s, e, _) in map.regions.iter().take(tunables.max_scan_regions) {
         if let Some(last) = merged.last_mut() {
             if last.1 == s {
                 last.1 = e;
@@ -135,7 +135,7 @@ pub fn aob_scan(pattern: &[u8], max_hits: usize) -> Vec<usize> {
         return hits;
     }
     let first = pattern[0];
-    for (start, end) in cache::snapshot() {
+    for (start, end, _) in cache::snapshot() {
         let len = end - start;
         if len < pattern.len() {
             continue;

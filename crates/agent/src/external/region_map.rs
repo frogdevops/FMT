@@ -12,9 +12,9 @@
 use std::ffi::c_void;
 
 use windows_sys::Win32::System::Memory::{
-    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ,
-    PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY,
-    PAGE_READWRITE, PAGE_WRITECOPY,
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+    PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
 };
 
 /// True iff the page protection bits allow plain reads (and the page isn't a
@@ -34,13 +34,13 @@ pub fn is_readable(protect: u32) -> bool {
 /// pointers/strings — every read is bounds-checked against a region first, so it
 /// can never fault.
 pub struct RegionMap {
-    pub(crate) regions: Vec<(usize, usize)>, // sorted (start, end)
+    pub(crate) regions: Vec<(usize, usize, u32)>, // sorted (start, end, protect)
 }
 
 impl RegionMap {
     /// Capture up to `max_regions` committed, readable regions. VirtualQuery only.
     pub fn capture(max_regions: usize) -> RegionMap {
-        let mut regions: Vec<(usize, usize)> = Vec::new();
+        let mut regions: Vec<(usize, usize, u32)> = Vec::new();
         unsafe {
             let mut addr: usize = 0;
             loop {
@@ -57,7 +57,7 @@ impl RegionMap {
                 let size = mbi.RegionSize;
                 let next = base.saturating_add(size);
                 if mbi.State == MEM_COMMIT && is_readable(mbi.Protect) && size >= 8 {
-                    regions.push((base, next));
+                    regions.push((base, next, mbi.Protect));
                     if regions.len() >= max_regions {
                         break;
                     }
@@ -83,8 +83,29 @@ impl RegionMap {
             Err(0) => return false,
             Err(i) => i - 1,
         };
-        let (start, region_end) = self.regions[idx];
+        let (start, region_end, _) = self.regions[idx];
         addr >= start && end <= region_end
+    }
+
+    /// True iff `addr` is inside a region whose page protection includes
+    /// EXECUTE. Used by structural probes (e.g. method_pointer_off) to
+    /// discriminate code pointers from other plausible-looking pointers in
+    /// the same struct. Structural — no version/game-specific knowledge.
+    pub fn is_executable(&self, addr: usize) -> bool {
+        const EXEC_MASK: u32 = PAGE_EXECUTE
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY;
+        let idx = match self.regions.binary_search_by(|r| r.0.cmp(&addr)) {
+            Ok(i) => i,
+            Err(0) => return false,
+            Err(i) => i - 1,
+        };
+        let (start, end, protect) = self.regions[idx];
+        if addr >= start && addr < end {
+            return (protect & EXEC_MASK) != 0;
+        }
+        false
     }
 
     pub fn read_u64(&self, addr: usize) -> Option<u64> {

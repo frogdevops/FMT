@@ -135,7 +135,10 @@ pub fn run_staleness_probe(table_base: usize, table_count: usize, cfg: &Il2CppCo
         std::thread::sleep(interval);
         let cur = RegionMap::capture(max_regions);
 
-        let churn = region_churn(&prev.regions, &cur.regions);
+        // region_churn expects (start, end) pairs; drop the protect flag.
+        let prev_pairs: Vec<(usize, usize)> = prev.regions.iter().map(|&(s, e, _)| (s, e)).collect();
+        let cur_pairs: Vec<(usize, usize)> = cur.regions.iter().map(|&(s, e, _)| (s, e)).collect();
+        let churn = region_churn(&prev_pairs, &cur_pairs);
         cumulative.added += churn.added;
         cumulative.removed += churn.removed;
         cumulative.changed += churn.changed;

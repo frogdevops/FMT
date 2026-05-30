@@ -26,9 +26,9 @@ pub fn scan(pattern: &[u8], max_hits: usize) -> Vec<usize> {
     aob_scan(pattern, max_hits)
 }
 
-/// (base, size, protect) for each cached readable region. (`protect` is 0 for now.)
+/// (base, size, protect) for each cached readable region.
 pub fn regions() -> Vec<(usize, usize, u32)> {
-    cache::snapshot().into_iter().map(|(s, e)| (s, e - s, 0u32)).collect()
+    cache::snapshot().into_iter().map(|(s, e, p)| (s, e - s, p)).collect()
 }
 
 pub fn write(addr: usize, value: &Value) -> Result<(), i32> {

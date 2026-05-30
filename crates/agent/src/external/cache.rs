@@ -65,7 +65,8 @@ fn live_readable(addr: usize, len: usize) -> bool {
 }
 
 /// Snapshot of current cached regions (for the `regions` op and the AOB scan).
-pub fn snapshot() -> Vec<(usize, usize)> {
+/// Returns `(start, end, protect)` triples.
+pub fn snapshot() -> Vec<(usize, usize, u32)> {
     regions().read().map(|g| g.regions.clone()).unwrap_or_default()
 }
 

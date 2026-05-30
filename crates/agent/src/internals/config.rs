@@ -110,6 +110,15 @@ pub struct Il2CppConfig {
 /// table; three forces at least minimal triangulation.
 const MIN_OVERRIDE_ANCHORS: u32 = 3;
 
+/// Phase 2's method probes have STRUCTURALLY only 2 anchors available
+/// (System::Math::Pow + System::String::PadLeft are the only pair of il2cpp
+/// stdlib methods with both unambiguous arity AND name AND universal
+/// presence). The strict 3-anchor gate would reject every Phase 2 override.
+/// Use this relaxed path for Phase 2 fields ONLY, and only when the probe's
+/// extract is structurally discriminating (e.g. method_pointer_off uses
+/// is_executable, not just "high pointer").
+const MIN_OVERRIDE_ANCHORS_PHASE2: u32 = 2;
+
 /// Apply a probe outcome to a config field. The fallback constant is a
 /// VERIFIED-CORRECT prior; a probe may only OVERRIDE it when it produced a
 /// winning offset AND gathered enough independent anchors (≥ MIN_OVERRIDE_ANCHORS).
@@ -118,8 +127,22 @@ const MIN_OVERRIDE_ANCHORS: u32 = 3;
 /// diverged from the baseline. When the probe fell back, or when the anchor count
 /// is below the threshold, the field is left at its prior value (the floor).
 fn apply_offset(field: &mut usize, outcome: &crate::internals::calibration::ProbeOutcome) {
+    apply_offset_with_threshold(field, outcome, MIN_OVERRIDE_ANCHORS);
+}
+
+/// Phase 2 method-field variant: relaxed anchor threshold (2 instead of 3).
+/// See `MIN_OVERRIDE_ANCHORS_PHASE2` for the structural justification.
+fn apply_offset_phase2(field: &mut usize, outcome: &crate::internals::calibration::ProbeOutcome) {
+    apply_offset_with_threshold(field, outcome, MIN_OVERRIDE_ANCHORS_PHASE2);
+}
+
+fn apply_offset_with_threshold(
+    field: &mut usize,
+    outcome: &crate::internals::calibration::ProbeOutcome,
+    min_anchors: u32,
+) {
     if let Some(off) = outcome.winning_offset {
-        if outcome.anchor_count < MIN_OVERRIDE_ANCHORS {
+        if outcome.anchor_count < min_anchors {
             // Too few anchors — log as weak and keep the verified-correct fallback.
             crate::paths::log(&format!(
                 "⚠ PROBE WEAK: {} probed={:#x} (only {}/{}) — keeping fallback {:#x}",
@@ -215,13 +238,13 @@ impl Il2CppConfig {
         let mpars = method_layout::probe_method_parameters_off(api, map, table_base, table_count, cts);
         let mret = method_layout::probe_method_return_type_off(api, map, table_base, table_count, cts);
         let mpc = method_layout::probe_method_param_count_off(api, map, table_base, table_count, cts);
-        apply_offset(&mut cfg.method_pointer_off, &mp);
-        apply_offset(&mut cfg.method_name_off, &mn);
-        apply_offset(&mut cfg.method_klass_off, &mk);
-        apply_offset(&mut cfg.method_flags_off, &mf);
-        apply_offset(&mut cfg.method_parameters_off, &mpars);
-        apply_offset(&mut cfg.method_return_type_off, &mret);
-        apply_offset(&mut cfg.method_param_count_off, &mpc);
+        apply_offset_phase2(&mut cfg.method_pointer_off, &mp);
+        apply_offset_phase2(&mut cfg.method_name_off, &mn);
+        apply_offset_phase2(&mut cfg.method_klass_off, &mk);
+        apply_offset_phase2(&mut cfg.method_flags_off, &mf);
+        apply_offset(&mut cfg.method_parameters_off, &mpars);     // loose probe; keep strict gate
+        apply_offset(&mut cfg.method_return_type_off, &mret);     // loose probe; keep strict gate
+        apply_offset_phase2(&mut cfg.method_param_count_off, &mpc);
         let phase2 = vec![mp, mn, mk, mf, mpars, mret, mpc];
         crate::paths::log("probe: Phase 2 (method) EXIT");
 
