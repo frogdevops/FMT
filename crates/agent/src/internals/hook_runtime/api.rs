@@ -33,7 +33,12 @@ pub(crate) struct CurrentContext {
 }
 
 thread_local! {
-    static CURRENT: RefCell<Option<CurrentContext>> = RefCell::new(None);
+    // Per-thread STACK so nested hook dispatches (handler A's call_original
+    // triggering hooked method B on the same thread) don't corrupt each
+    // other's context. Each dispatch pushes; the same dispatch pops at the
+    // end of with_current_context. Host fns operate on `.last()` / `.last_mut()`
+    // — the top of stack = the currently-active hook context.
+    static CURRENT: RefCell<Vec<CurrentContext>> = RefCell::new(Vec::new());
 }
 
 /// Called by the dispatcher with the per-method context. Pushes context onto
@@ -54,9 +59,9 @@ pub fn with_current_context(
 ) {
     crate::paths::log(&format!("with_current_context: ENTRY method={:#x}", ctx.method.as_u64()));
 
-    // Push our context onto the per-thread slot.
+    // PUSH our context onto the per-thread stack. Pairs with the pop below.
     CURRENT.with(|c| {
-        *c.borrow_mut() = Some(CurrentContext {
+        c.borrow_mut().push(CurrentContext {
             method:          ctx.method,
             regs,
             args:            args.to_vec(),
@@ -73,9 +78,11 @@ pub fn with_current_context(
         crate::paths::log(&format!("hook handler call failed: {:?}", e));
     }
 
+    // POP the top of stack — the context we pushed above. Underflow would
+    // mean a push/pop pairing bug elsewhere; expect-panic is the right
+    // visibility on that invariant.
     let result = CURRENT.with(|c| {
-        let mut borrow = c.borrow_mut();
-        let cc = borrow.take().expect("context vanished");
+        let cc = c.borrow_mut().pop().expect("context underflow");
         HandlerResult {
             return_value: cc.explicit_return,
             called_original: cc.called_original,
@@ -214,7 +221,7 @@ pub fn remove_hook(handle: HookHandle) -> Result<(), HookError> {
 pub fn hook_arg_read(arg_idx: usize) -> Result<Vec<u8>, agent_core::spine::InvokeError> {
     CURRENT.with(|c| {
         let borrow = c.borrow();
-        let cc = borrow.as_ref()
+        let cc = borrow.last()
             .ok_or(agent_core::spine::InvokeError::InternalFailure("hook_arg outside handler"))?;
         let arg = cc.args.get(arg_idx)
             .ok_or(agent_core::spine::InvokeError::ArgCountMismatch {
@@ -232,7 +239,7 @@ pub fn hook_arg_write(arg_idx: usize, bytes: &[u8]) -> Result<(), agent_core::sp
     use crate::internals::marshal::args_to_regargs;
     CURRENT.with(|c| {
         let mut borrow = c.borrow_mut();
-        let cc = borrow.as_mut()
+        let cc = borrow.last_mut()
             .ok_or(agent_core::spine::InvokeError::InternalFailure("hook_set_arg outside handler"))?;
         let (decoded, _) = agent_core::spine::InvokeArg::decode(bytes)
             .ok_or(agent_core::spine::InvokeError::MarshalFailed { idx: arg_idx as u8, reason: "decode failed" })?;
@@ -254,7 +261,7 @@ pub fn hook_arg_write(arg_idx: usize, bytes: &[u8]) -> Result<(), agent_core::sp
 pub fn hook_this_get() -> u64 {
     CURRENT.with(|c| {
         let borrow = c.borrow();
-        let cc = match borrow.as_ref() { Some(x) => x, None => return 0 };
+        let cc = match borrow.last() { Some(x) => x, None => return 0 };
         let regs = unsafe { &*cc.regs };
         // `this` is always physical slot 0 for instance methods. We re-read
         // signature to know is_static.
@@ -272,7 +279,7 @@ pub fn hook_set_return(bytes: &[u8]) -> Result<(), agent_core::spine::InvokeErro
         .ok_or(agent_core::spine::InvokeError::MarshalFailed { idx: 0, reason: "decode failed" })?;
     CURRENT.with(|c| {
         let mut borrow = c.borrow_mut();
-        let cc = borrow.as_mut()
+        let cc = borrow.last_mut()
             .ok_or(agent_core::spine::InvokeError::InternalFailure("hook_set_return outside handler"))?;
         cc.explicit_return = Some(decoded);
         Ok(())
@@ -287,7 +294,7 @@ pub fn call_original_now() -> Result<Vec<u8>, agent_core::spine::InvokeError> {
 
     let (regs_ptr, sig_return_type, sig_return_tc, trampoline) = CURRENT.with(|c| -> Option<_> {
         let mut borrow = c.borrow_mut();
-        let cc = borrow.as_mut()?;
+        let cc = borrow.last_mut()?;
         // Find the trampoline + sig via the registry — we look up by walking
         // until we find the slot whose method matches. Slow but bounded (256).
         for id in 0..crate::internals::hook_runtime::registry::MAX_HOOKS as u64 {

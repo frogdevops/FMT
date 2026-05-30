@@ -10,7 +10,7 @@ use agent_core::wasm::WasmError;
 
 use crate::external::api;
 
-struct HostState {
+pub struct HostState {
     logs: Vec<String>,
 }
 
@@ -293,5 +293,24 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
         .get_typed_func::<(), ()>(&store, "frog_main")
         .map_err(|_| WasmError::NoEntry)?;
     frog_main.call(&mut store, ()).map_err(|e| WasmError::Trap(e.to_string()))?;
-    Ok(store.into_data().logs)
+
+    // B-3 Section 1+2: park the Store + instance + funcref table so post-
+    // frog_main hook callbacks (fired from game thread) can try_lock and
+    // invoke the registered handler funcref via wasmi typed call. Clone
+    // logs out FIRST (into_data() consumes; we need to keep Store alive).
+    let logs = store.data().logs.clone();
+
+    // B-3 Section 2: funcref table is OPTIONAL. Scripts that use hooks
+    // (install_hook) must export a funcref table under the LLVM-compatible
+    // name "__indirect_function_table". Scripts that don't use hooks
+    // (e.g. test_invoke.wasm) don't need one — the field is None and
+    // call_hook_handler returns a clear error at dispatch time.
+    let funcref_table = instance
+        .get_table(&store, "__indirect_function_table");
+
+    *crate::runtime::host::parked().lock().unwrap() = Some(
+        crate::runtime::host::ParkedStore { store, instance, funcref_table }
+    );
+
+    Ok(logs)
 }
