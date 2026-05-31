@@ -43,6 +43,8 @@ pub struct FieldInfoRaw {
     pub offset:      u32,
     pub val_type:    ValType,
     pub token:       u32,
+    pub is_static:   bool,
+    pub type_ptr:    usize,
     pub next_cursor: usize,
 }
 

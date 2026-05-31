@@ -12,6 +12,7 @@ pub mod value;
 pub mod access;
 pub mod mem_backend;
 pub mod metadata_backend;
+pub mod scan_backend;
 pub mod journal;
 
 pub use addr::{MemAddr, ReadOnly, ReadWrite};
