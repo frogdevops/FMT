@@ -79,39 +79,46 @@ fn watcher_loop() {
                 write_state();
             }
             (None, Some(meta)) => {
-                // First appearance — wait one tick for stability.
+                // First sighting — try to load. Parse-check catches mid-write
+                // partial files. On parse fail we still store meta so we don't
+                // re-parse the same partial bytes every tick; when the writer
+                // completes, mtime changes and the (Some, Some) arm fires.
                 last_seen = Some(meta);
+                try_load(&path, fallback_deadline);
             }
             (Some(prev), Some(meta)) => {
                 if prev == meta {
                     continue; // unchanged
                 }
-                // Changed. Settle: store the new meta and wait for the NEXT
-                // tick; act only when next-tick meta matches this-tick meta.
                 last_seen = Some(meta);
-                // Probe: if file is mid-write, the next read fails or returns
-                // partial bytes. We rely on the parse-check below to validate.
-                let bytes = match fs::read(&path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        log(&format!("watcher: read failed {:?} — will retry on next change", e));
-                        continue;
-                    }
-                };
-                // Parse-check: malformed wasm doesn't trigger teardown.
-                let engine = wasmi::Engine::default();
-                if let Err(e) = wasmi::Module::new(&engine, &bytes) {
-                    log(&format!("watcher: parse failed {:?} — leaving current runtime alone", e));
-                    continue;
-                }
-                log(&format!("watcher: detected valid change ({} bytes) — publishing reload", bytes.len()));
-                publish_reload(bytes.clone());
-                wait_for_consume_or_fallback(Some(&bytes), fallback_deadline);
-                write_state();
+                try_load(&path, fallback_deadline);
             }
         }
     }
     log("watcher: thread exiting");
+}
+
+/// Read + parse-check + publish reload. Shared by the (None, Some) first-sighting
+/// arm and the (Some, Some) change arm. On read/parse failure logs and returns
+/// without disturbing the current runtime — the next mtime change will retry.
+fn try_load(path: &Path, fallback_deadline: u64) {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            log(&format!("watcher: read failed {:?} — will retry on next change", e));
+            return;
+        }
+    };
+    // Parse-check: malformed wasm doesn't trigger teardown.
+    let engine = wasmi::Engine::default();
+    if let Err(e) = wasmi::Module::new(&engine, &bytes) {
+        log(&format!("watcher: parse failed {:?} — leaving current runtime alone", e));
+        return;
+    }
+    log(&format!("watcher: detected valid script ({} bytes) — publishing reload", bytes.len()));
+    publish_reload(bytes.clone());
+    wait_for_consume_or_fallback(Some(&bytes), fallback_deadline);
+    write_state();
 }
 
 fn stat_meta(path: &Path) -> Option<(SystemTime, u64)> {
