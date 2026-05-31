@@ -1,7 +1,8 @@
-//! WASM runtime with the external `mem.*` host API. Read trio always registered;
-//! write pair only when `write_granted` (the gate — a non-granted module that
-//! imports `mem.write` fails at instantiation). Results cross into the guest's own
-//! linear memory via guest-provided buffers, bounds-checked exactly like `log`.
+//! WASM runtime with the external `mem.*` host API. Read trio and write trio
+//! (`write` / `write_if` / `write_permanent`) are always registered per
+//! [[wild-west-platform-philosophy]] — the `FROG_WASM_WRITE` gate was removed
+//! in B-6a. Results cross into the guest's own linear memory via guest-provided
+//! buffers, bounds-checked exactly like `log`.
 
 use wasmi::{Caller, Config, Engine, Linker, Module, Store};
 
@@ -13,6 +14,25 @@ use crate::external::api;
 
 pub struct HostState {
     logs: Vec<String>,
+    /// Runtime id assigned at spawn (before `frog_main` runs), used by
+    /// `host_install_hook` to tag new HookCtx entries via REGISTRY-independent
+    /// lookup. Solves the timing problem where REGISTRY is empty during
+    /// frog_main but install_hook still needs to know which runtime owns
+    /// the new hook.
+    pub runtime_id: u64,
+    /// First-touched original bytes per address. Captured by `host_write` /
+    /// `host_write_if` on first touch of each addr; reverted at script stop by
+    /// the orchestrator (Task 7).
+    ///
+    /// Lives in HostState (inside the wasmi Store), NOT in ParkedRuntime
+    /// (outside the Store). Reason: `call_hook_handler` holds the REGISTRY
+    /// lock across the wasm `typed.call(&mut runtime.store, ())`. If
+    /// `write_journal` lived in ParkedRuntime, a wasm handler's call to
+    /// `mem.write` would trigger journal_touch → registry().lock() on the
+    /// same thread → poisoned-mutex panic. By living in HostState, the
+    /// journal is reached via `caller.data_mut()` — exclusive access
+    /// guaranteed by wasmi, no REGISTRY lock needed.
+    pub write_journal: agent_core::spine::WriteJournal,
 }
 
 fn read_guest(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
@@ -62,7 +82,7 @@ fn host_read_typed<T: MemValue>(
 /// Dispatch a typed write of `T` from the guest's `in_ptr`+`in_len` buffer to
 /// `addr`. Returns OK or a negative status code.
 fn host_write_typed<T: MemValue>(
-    caller: &Caller<'_, HostState>,
+    caller: &mut Caller<'_, HostState>,
     addr: MemAddr<ReadWrite>,
     in_ptr: i32,
     in_len: i32,
@@ -75,6 +95,14 @@ fn host_write_typed<T: MemValue>(
         Some(v) => v,
         None => return status::ERR_BAD_TYPE,
     };
+    // Journal first-touch capture via HostState (NOT via REGISTRY — see
+    // HostState.write_journal doc comment for why). caller.data_mut() gives
+    // exclusive &mut access to HostState; no lock needed.
+    let width = T::VAL_TYPE.fixed_width().unwrap_or(0);
+    if width > 0 {
+        let raw_addr = addr.as_u64() as usize;
+        caller.data_mut().write_journal.touch(raw_addr, width);
+    }
     match api::write::<T>(addr, val) {
         Ok(()) => status::OK,
         Err(e) => i32::from(e),
@@ -86,7 +114,7 @@ fn host_write_typed<T: MemValue>(
 /// or a negative status code on read/write failure. Not atomic — read+compare+
 /// write under the cache mutex but no CPU CAS primitive.
 fn host_write_if_typed<T: MemValue + PartialEq>(
-    _caller: &Caller<'_, HostState>,
+    caller: &mut Caller<'_, HostState>,
     addr: MemAddr<ReadWrite>,
     exp_bytes: &[u8],
     new_bytes: &[u8],
@@ -105,6 +133,12 @@ fn host_write_if_typed<T: MemValue + PartialEq>(
     };
     if cur != exp {
         return status::CHANGED;
+    }
+    // Journal first-touch capture via HostState — see host_write_typed comment.
+    let width = T::VAL_TYPE.fixed_width().unwrap_or(0);
+    if width > 0 {
+        let raw_addr = addr.as_u64() as usize;
+        caller.data_mut().write_journal.touch(raw_addr, width);
     }
     match api::write::<T>(addr, new) {
         Ok(()) => status::OK,
@@ -174,23 +208,24 @@ fn host_regions(mut caller: Caller<'_, HostState>, out_ptr: i32, out_cap_count: 
     take as i32
 }
 
-fn host_write(caller: Caller<'_, HostState>, addr: i64, ty: i32, in_ptr: i32, in_len: i32) -> i32 {
+fn host_write(mut caller: Caller<'_, HostState>, addr: i64, ty: i32, in_ptr: i32, in_len: i32) -> i32 {
     let ty = match ValType::from_tag(ty as u8) { Some(t) => t, None => return status::ERR_BAD_TYPE };
-    // SAFETY: writes are gated by `write_granted` at linker registration; reaching
-    // host_write means the script declared write intent. The typed-write helper
-    // delegates to api::write which calls the cache-validated backend.
+    // SAFETY: writes are unconditional per [[wild-west-platform-philosophy]];
+    // the FROG_WASM_WRITE gate was removed in B-6a. The typed-write helper
+    // delegates to api::write which calls the cache-validated backend, and
+    // journal_touch records the first-touch original bytes for revert.
     let addr = unsafe { MemAddr::<ReadWrite>::from_raw_writable(addr as u64) };
     match ty {
-        ValType::U8  => host_write_typed::<u8 >(&caller, addr, in_ptr, in_len),
-        ValType::U16 => host_write_typed::<u16>(&caller, addr, in_ptr, in_len),
-        ValType::U32 => host_write_typed::<u32>(&caller, addr, in_ptr, in_len),
-        ValType::U64 => host_write_typed::<u64>(&caller, addr, in_ptr, in_len),
-        ValType::I8  => host_write_typed::<i8 >(&caller, addr, in_ptr, in_len),
-        ValType::I16 => host_write_typed::<i16>(&caller, addr, in_ptr, in_len),
-        ValType::I32 => host_write_typed::<i32>(&caller, addr, in_ptr, in_len),
-        ValType::I64 => host_write_typed::<i64>(&caller, addr, in_ptr, in_len),
-        ValType::F32 => host_write_typed::<f32>(&caller, addr, in_ptr, in_len),
-        ValType::F64 => host_write_typed::<f64>(&caller, addr, in_ptr, in_len),
+        ValType::U8  => host_write_typed::<u8 >(&mut caller, addr, in_ptr, in_len),
+        ValType::U16 => host_write_typed::<u16>(&mut caller, addr, in_ptr, in_len),
+        ValType::U32 => host_write_typed::<u32>(&mut caller, addr, in_ptr, in_len),
+        ValType::U64 => host_write_typed::<u64>(&mut caller, addr, in_ptr, in_len),
+        ValType::I8  => host_write_typed::<i8 >(&mut caller, addr, in_ptr, in_len),
+        ValType::I16 => host_write_typed::<i16>(&mut caller, addr, in_ptr, in_len),
+        ValType::I32 => host_write_typed::<i32>(&mut caller, addr, in_ptr, in_len),
+        ValType::I64 => host_write_typed::<i64>(&mut caller, addr, in_ptr, in_len),
+        ValType::F32 => host_write_typed::<f32>(&mut caller, addr, in_ptr, in_len),
+        ValType::F64 => host_write_typed::<f64>(&mut caller, addr, in_ptr, in_len),
         // Variable-length writes are not supported through this host fn; the
         // raw `api::write` path did not support them either (it returned
         // ERR_BAD_TYPE on empty bytes). Preserve that semantic:
@@ -198,25 +233,68 @@ fn host_write(caller: Caller<'_, HostState>, addr: i64, ty: i32, in_ptr: i32, in
     }
 }
 
-fn host_write_if(caller: Caller<'_, HostState>, addr: i64, ty: i32, exp_ptr: i32, exp_len: i32, new_ptr: i32, new_len: i32) -> i32 {
+fn host_write_if(mut caller: Caller<'_, HostState>, addr: i64, ty: i32, exp_ptr: i32, exp_len: i32, new_ptr: i32, new_len: i32) -> i32 {
     let ty = match ValType::from_tag(ty as u8) { Some(t) => t, None => return status::ERR_BAD_TYPE };
     let exp_b = match read_guest(&caller, exp_ptr, exp_len) { Some(b) => b, None => return status::ERR_BAD_TYPE };
     let new_b = match read_guest(&caller, new_ptr, new_len) { Some(b) => b, None => return status::ERR_BAD_TYPE };
-    // SAFETY: write_if is gated by write_granted at linker registration; reaching
-    // host_write_if means the script declared write intent.
+    // SAFETY: write_if is unconditional per [[wild-west-platform-philosophy]];
+    // the FROG_WASM_WRITE gate was removed in B-6a.
     let addr = unsafe { MemAddr::<ReadWrite>::from_raw_writable(addr as u64) };
     match ty {
-        ValType::U8  => host_write_if_typed::<u8 >(&caller, addr, &exp_b, &new_b),
-        ValType::U16 => host_write_if_typed::<u16>(&caller, addr, &exp_b, &new_b),
-        ValType::U32 => host_write_if_typed::<u32>(&caller, addr, &exp_b, &new_b),
-        ValType::U64 => host_write_if_typed::<u64>(&caller, addr, &exp_b, &new_b),
-        ValType::I8  => host_write_if_typed::<i8 >(&caller, addr, &exp_b, &new_b),
-        ValType::I16 => host_write_if_typed::<i16>(&caller, addr, &exp_b, &new_b),
-        ValType::I32 => host_write_if_typed::<i32>(&caller, addr, &exp_b, &new_b),
-        ValType::I64 => host_write_if_typed::<i64>(&caller, addr, &exp_b, &new_b),
-        ValType::F32 => host_write_if_typed::<f32>(&caller, addr, &exp_b, &new_b),
-        ValType::F64 => host_write_if_typed::<f64>(&caller, addr, &exp_b, &new_b),
+        ValType::U8  => host_write_if_typed::<u8 >(&mut caller, addr, &exp_b, &new_b),
+        ValType::U16 => host_write_if_typed::<u16>(&mut caller, addr, &exp_b, &new_b),
+        ValType::U32 => host_write_if_typed::<u32>(&mut caller, addr, &exp_b, &new_b),
+        ValType::U64 => host_write_if_typed::<u64>(&mut caller, addr, &exp_b, &new_b),
+        ValType::I8  => host_write_if_typed::<i8 >(&mut caller, addr, &exp_b, &new_b),
+        ValType::I16 => host_write_if_typed::<i16>(&mut caller, addr, &exp_b, &new_b),
+        ValType::I32 => host_write_if_typed::<i32>(&mut caller, addr, &exp_b, &new_b),
+        ValType::I64 => host_write_if_typed::<i64>(&mut caller, addr, &exp_b, &new_b),
+        ValType::F32 => host_write_if_typed::<f32>(&mut caller, addr, &exp_b, &new_b),
+        ValType::F64 => host_write_if_typed::<f64>(&mut caller, addr, &exp_b, &new_b),
         ValType::Bytes | ValType::Cstr => status::ERR_BAD_TYPE,
+    }
+}
+
+fn host_write_permanent(caller: Caller<'_, HostState>, addr: i64, ty: i32, in_ptr: i32, in_len: i32) -> i32 {
+    let ty = match ValType::from_tag(ty as u8) { Some(t) => t, None => return status::ERR_BAD_TYPE };
+    // SAFETY: write_permanent is unconditional per [[wild-west-platform-philosophy]];
+    // gating was removed in this brick. The actor's call to write_permanent is the
+    // declaration that this change survives script stop (no journal recording).
+    let addr = unsafe { MemAddr::<ReadWrite>::from_raw_writable(addr as u64) };
+
+    // Same ValType dispatch as host_write, but skip the journal touch.
+    match ty {
+        ValType::U8  => host_write_permanent_typed::<u8 >(&caller, addr, in_ptr, in_len),
+        ValType::U16 => host_write_permanent_typed::<u16>(&caller, addr, in_ptr, in_len),
+        ValType::U32 => host_write_permanent_typed::<u32>(&caller, addr, in_ptr, in_len),
+        ValType::U64 => host_write_permanent_typed::<u64>(&caller, addr, in_ptr, in_len),
+        ValType::I8  => host_write_permanent_typed::<i8 >(&caller, addr, in_ptr, in_len),
+        ValType::I16 => host_write_permanent_typed::<i16>(&caller, addr, in_ptr, in_len),
+        ValType::I32 => host_write_permanent_typed::<i32>(&caller, addr, in_ptr, in_len),
+        ValType::I64 => host_write_permanent_typed::<i64>(&caller, addr, in_ptr, in_len),
+        ValType::F32 => host_write_permanent_typed::<f32>(&caller, addr, in_ptr, in_len),
+        ValType::F64 => host_write_permanent_typed::<f64>(&caller, addr, in_ptr, in_len),
+        ValType::Bytes | ValType::Cstr => status::ERR_BAD_TYPE,
+    }
+}
+
+fn host_write_permanent_typed<T: MemValue>(
+    caller: &Caller<'_, HostState>,
+    addr: MemAddr<ReadWrite>,
+    in_ptr: i32,
+    in_len: i32,
+) -> i32 {
+    let bytes = match read_guest(caller, in_ptr, in_len) {
+        Some(b) => b,
+        None => return status::ERR_BAD_TYPE,
+    };
+    let val = match T::from_le_bytes_spine(&bytes) {
+        Some(v) => v,
+        None => return status::ERR_BAD_TYPE,
+    };
+    match api::write::<T>(addr, val) {
+        Ok(()) => status::OK,
+        Err(e) => i32::from(e),
     }
 }
 
@@ -284,13 +362,14 @@ fn host_find_method(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, na
 }
 
 fn host_install_hook(
-    _caller: wasmi::Caller<'_, HostState>,
+    caller: wasmi::Caller<'_, HostState>,
     method_ptr: i64,
     handler_funcref_table_idx: i32,
 ) -> i64 {
     use agent_core::spine::MethodPtr;
     let method = MethodPtr::from_raw(method_ptr as u64);
-    match crate::internals::hook_runtime::api::install_hook(method, handler_funcref_table_idx as u64) {
+    let runtime_id = caller.data().runtime_id;
+    match crate::internals::hook_runtime::api::install_hook(method, handler_funcref_table_idx as u64, runtime_id) {
         Ok(handle) => handle.as_u64() as i64,
         Err(e)     => i32::from(e) as i64,   // negative codes -200..-205 sign-extend
     }
@@ -395,14 +474,23 @@ fn host_invoke(mut caller: Caller<'_, HostState>, method_ptr: i64, instance_ptr:
     }
 }
 
-/// Run a module with the mem API. `write_granted` decides whether the write
-/// imports exist at all (the gate). Returns the lines it logged.
-pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<String>, WasmError> {
+/// Run a module with the mem API. Writes are unconditional per
+/// [[wild-west-platform-philosophy]]; the FROG_WASM_WRITE gate was removed
+/// in B-6a. Returns the lines it logged.
+pub fn run_wasm_with_mem(wasm_bytes: &[u8]) -> Result<Vec<String>, WasmError> {
     let mut config = Config::default();
     config.consume_fuel(true);
     let engine = Engine::new(&config);
     let module = Module::new(&engine, wasm_bytes).map_err(|e| WasmError::Parse(e.to_string()))?;
-    let mut store = Store::new(&engine, HostState { logs: Vec::new() });
+    // Pre-allocate the runtime id so HostState can carry it through frog_main.
+    // host_install_hook reads this via caller.data().runtime_id to tag new
+    // HookCtx entries, avoiding the REGISTRY-empty-during-frog_main timing bug.
+    let runtime_id = crate::runtime::registry::next_runtime_id();
+    let mut store = Store::new(&engine, HostState {
+        logs: Vec::new(),
+        runtime_id: runtime_id.0,
+        write_journal: crate::runtime::registry::new_journal(),
+    });
     store.set_fuel(1_000_000).map_err(|e| WasmError::Instantiate(e.to_string()))?;
 
     let mut linker = Linker::<HostState>::new(&engine);
@@ -424,10 +512,11 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
     linker.func_wrap("il2cpp", "hook_this",       host_hook_this).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "call_original",   host_call_original).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "hook_set_return", host_hook_set_return).map_err(|e| WasmError::Instantiate(e.to_string()))?;
-    if write_granted {
-        linker.func_wrap("mem", "write", host_write).map_err(|e| WasmError::Instantiate(e.to_string()))?;
-        linker.func_wrap("mem", "write_if", host_write_if).map_err(|e| WasmError::Instantiate(e.to_string()))?;
-    }
+    // Per [[wild-west-platform-philosophy]] writes are unconditional.
+    // The FROG_WASM_WRITE env gate was removed in B-6a.
+    linker.func_wrap("mem", "write", host_write).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("mem", "write_if", host_write_if).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("mem", "write_permanent", host_write_permanent).map_err(|e| WasmError::Instantiate(e.to_string()))?;
 
     let instance = linker
         .instantiate(&mut store, &module)
@@ -438,10 +527,11 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
         .map_err(|_| WasmError::NoEntry)?;
     frog_main.call(&mut store, ()).map_err(|e| WasmError::Trap(e.to_string()))?;
 
-    // B-3 Section 1+2: park the Store + instance + funcref table so post-
-    // frog_main hook callbacks (fired from game thread) can try_lock and
-    // invoke the registered handler funcref via wasmi typed call. Clone
-    // logs out FIRST (into_data() consumes; we need to keep Store alive).
+    // B-6a (was B-3): insert Store + instance + funcref table into REGISTRY
+    // as a ParkedRuntime so post-frog_main hook callbacks (fired from game
+    // thread) can try_lock REGISTRY and invoke the registered handler funcref
+    // via wasmi typed call. Clone logs out FIRST (into_data() consumes; we
+    // need to keep Store alive).
     let logs = store.data().logs.clone();
 
     // B-3 Section 2: funcref table is OPTIONAL. Scripts that use hooks
@@ -452,9 +542,16 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8], write_granted: bool) -> Result<Vec<S
     let funcref_table = instance
         .get_table(&store, "__indirect_function_table");
 
-    *crate::runtime::host::parked().lock().unwrap() = Some(
-        crate::runtime::host::ParkedStore { store, instance, funcref_table }
-    );
+    // B-6a: instead of parking into PARKED, insert a ParkedRuntime into REGISTRY.
+    // Caller (orchestrator or initial spawn) must ensure the registry is empty
+    // before calling — assertion lives in registry::insert.
+    crate::runtime::registry::insert(crate::runtime::registry::ParkedRuntime {
+        id: runtime_id,
+        store,
+        instance,
+        funcref_table,
+        owned_hooks: Vec::new(),
+    });
 
     Ok(logs)
 }

@@ -108,6 +108,7 @@ pub fn with_current_context(
 pub fn install_hook(
     method: MethodPtr,
     handler_func_ref: u64,
+    runtime_id: u64,  // set by caller (host_install_hook) from HostState
 ) -> Result<HookHandle, HookError> {
     crate::paths::log(&format!("install_hook: ENTRY method={:#x} handler={}", method.as_u64(), handler_func_ref));
 
@@ -180,12 +181,16 @@ pub fn install_hook(
     crate::paths::log(&format!("install_hook: [5/6] patched methodPointer trampoline={:#x}", patch.trampoline));
 
     // Step 6: build HookCtx and publish (Release store — dispatchers see it).
-    let ctx = HookCtx { method, sig, thunk_addr, patch, handler_func_ref };
+    // runtime_id is threaded in from HostState (set before frog_main runs),
+    // so this works even when REGISTRY is still empty during frog_main.
+    let ctx = HookCtx { method, sig, thunk_addr, patch, handler_func_ref, runtime_id };
     unsafe { publish_slot(id, ctx); }
     crate::paths::log(&format!("install_hook: [6/6] published slot id={} — DONE", id));
 
-    // Step 7: return the opaque handle.
-    Ok(HookHandle::from_raw(id))
+    let handle = HookHandle::from_raw(id);
+    crate::runtime::registry::record_hook(handle);
+
+    Ok(handle)
 }
 
 /// Remove an installed hook. Restores original bytes, frees the thunk slot.

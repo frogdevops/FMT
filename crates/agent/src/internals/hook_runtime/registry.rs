@@ -38,6 +38,10 @@ pub struct HookCtx {
     /// Stored as raw bits to keep this struct Send/Sync; see api.rs for
     /// the safe wrapper.
     pub handler_func_ref: u64,
+    /// The id of the runtime that installed this hook. Used at reload time
+    /// to scan-and-unhook only the hooks owned by the runtime being torn down.
+    /// Populated by `install_hook` from the current `REGISTRY` entry.
+    pub runtime_id: u64,
 }
 
 // SAFETY: ctx is only read while SLOT_VALID[id] is Acquire-true. Writers

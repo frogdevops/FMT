@@ -193,7 +193,45 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
         crate::diagnostics::export_dump::run_export_dump_probe();
     }
 
-    crate::runtime::host::maybe_run_configured();
+    // B-6a: ensure scripts/ folder exists, perform initial load if a script
+    // is already present at startup, then spawn the watcher.
+    // FROG_WASM env var is deleted; watcher is the sole loader for WASM scripts.
+    let scripts_dir = crate::paths::output_path("scripts");
+    if let Err(e) = std::fs::create_dir_all(&scripts_dir) {
+        crate::paths::log(&format!("entry: create scripts dir failed {:?}", e));
+    } else {
+        crate::paths::log(&format!("entry: scripts dir ready at {:?}", scripts_dir));
+    }
+
+    // Cold-start load: if scripts/active.wasm already exists at game launch,
+    // the watcher's "first-sighting is settle-wait" pattern won't trigger a
+    // load — it only acts on subsequent CHANGES after startup. Bridge that
+    // by checking once at init and running registry_reload if a script
+    // is already there. The runtime is parked into REGISTRY by
+    // run_wasm_with_mem (inside registry_reload's spawn_fresh path).
+    let active_wasm = crate::paths::output_path("scripts/active.wasm");
+    if active_wasm.exists() {
+        match std::fs::read(&active_wasm) {
+            Ok(bytes) => {
+                crate::paths::log(&format!(
+                    "entry: cold-start load of scripts/active.wasm ({} bytes)",
+                    bytes.len()
+                ));
+                crate::runtime::orchestrator::registry_reload(&bytes);
+            }
+            Err(e) => crate::paths::log(&format!("entry: cold-start read failed {:?}", e)),
+        }
+    } else {
+        crate::paths::log("entry: no scripts/active.wasm at startup; watcher will pick up future drops");
+    }
+
+    // Spawn the watcher. Note: on its first tick the watcher will see the
+    // (now-loaded) scripts/active.wasm via the (None, Some(meta)) settle-wait
+    // arm — it records meta and waits, doing nothing. On tick 2 with prev==meta
+    // it continues. The cold-start load above already parked the runtime, so
+    // the watcher's no-op on first sighting is the correct behavior — no
+    // double-load occurs.
+    crate::runtime::watcher::spawn();
 
     // Start TCP server
     crate::protocol::start_tcp_server();
@@ -222,6 +260,15 @@ pub extern "system" fn DllMain(_module: HMODULE, reason: u32, _reserved: *mut c_
         }
         DLL_PROCESS_DETACH => {
             unsafe {
+                // B-6a: signal watcher to stop, then unhook all runtime-owned
+                // hooks so no game-code patches survive into the next session.
+                // registry_reload(&[]) does the full revert + unhook + drop;
+                // the journal revert + unhook are CORRECT cleanup (game must
+                // exit with no surviving patches), the state-file rewrite at
+                // the end is the only wasteful work (state about to vanish).
+                // Optimization (skip state-file write on DETACH) is banked.
+                crate::runtime::watcher::stop();
+                crate::runtime::orchestrator::registry_reload(&[]);
                 crate::protocol::remove_packet_hooks();
             }
         }

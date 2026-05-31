@@ -12,6 +12,7 @@ pub mod value;
 pub mod access;
 pub mod mem_backend;
 pub mod metadata_backend;
+pub mod journal;
 
 pub use addr::{MemAddr, ReadOnly, ReadWrite};
 pub use error::{HookError, InvokeError, MemError};
@@ -20,3 +21,4 @@ pub use handles::{FieldAddr, FrameSeq, HookHandle, Instance, KlassPtr, MethodPtr
 pub use invoke_arg::InvokeArg;
 pub use value::MemValue;
 pub use access::{Iter, Read, Write};
+pub use journal::{JournalReadFn, WriteJournal};
