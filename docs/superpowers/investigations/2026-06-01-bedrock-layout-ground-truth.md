@@ -110,5 +110,30 @@ The seven witnesses are NOT flat or independent — they sit on a foundation sta
 
 **Revised minimal trustworthy set:** not seven flat witnesses, but **the foundations (stride, root, region) each validated by a mechanically-orthogonal cross-check, + one out-of-band anchor** — and ONLY then do the offset/self-consistency witnesses carry weight.
 
+## VERIFICATION (code-checked 2026-06-01) — corrections to the flaw table
+
+Reverified the foundation claims against source. Several flaws were over-stated; the real bug is narrower and the foundation is sounder than first feared.
+
+- **Flaw A (stride) — DOWNGRADED.** `find_class_table` (scan.rs:74-127) scans at **8-byte granularity** (finest, = pointer alignment) and keeps every slot passing `class_fields`. It cannot skip an 8-aligned klass pointer; there is no coarse `class_table_step` to get wrong here. `38%` = correct stride, sparse table. (Residual nit only: a stride-16-with-null-padding table would inflate the slot *count*, never miss/misread a klass; confirm downstream table iteration reuses 8.)
+- **Flaw C (shared PE parser) — COLLAPSES for the region map.** `RegionMap::capture` (region_map.rs:42-72) is **`VirtualQuery`-only** (kernel page state, no PE parsing) — it already IS the orthogonal page-walk. Flaw C applies ONLY to `find_types_array` / metadata-registration scans, NOT the table or region map. (Proton caveat: VirtualQuery is Wine-ntdll-serviced, seeded by Wine's loader but kept current by runtime VirtualProtect — independent of probe-time header re-parsing.)
+- **Root locator — VERIFIED SOUND.** `class_fields` (region_map.rs:219-229) validates `klass+0 → Il2CppImage → name ".dll"` + cstr name@0x10 + ns@0x18. A run of ≥`min_classes` consecutive such slots cannot occur by chance. Strongest component in the pipeline. (image@0x00 / name@0x10 / namespace@0x18 confirmed identical on PW + Highrise; "invariant v16-v31" is external-knowledge, not proven here — treat as strong prior, not fact.)
+- **`klass_static_fields` — NOT silent rot.** klass_layout.rs:~248 is honestly conservative: 0.99 threshold, "NO honest discriminator… falls back… honest about the lack of independent verification." Residual: the honesty **stops at the log**; the consumer reads `0xB8` with no unverified flag.
+
+### CONFIRMED BUG — the `klass_methods` cascade (klass_layout.rs:243-245)
+```rust
+let method_pointer = map.read_u64(method_info_ptr + 0x08)?;   // HARDCODED 0x08
+if method_pointer < 0x10_0000 { return None; }                // weak "is biggish" check
+```
+`method_pointer_off` is NOT 0x08 (PW probed it to 0x0, Phase 2, AFTER this runs). So:
+- **Highrise false-FAIL:** `+0x08` is small/zero on the correct `0x98` array → 0/50 → fallback.
+- **PW false-PASS:** `+0x08` holds some ptr ≥0x10_0000 for 46/50 by luck → "passes" without validating. `0x98`-correct-on-PW is coincidence.
+Non-functional in both directions. (klass_static_fields' real-failure is the *absence of a discriminator*, a different, honestly-handled case.)
+
+### The fix (non-circular, structural-only)
+Recognize the **methods array** by intrinsic structure, zero calibrated sub-offsets: *a pointer array whose entries point to structs each containing ≥1 pointer into an **RX (execute) region*** — RX comes free from the confirmed-sound `VirtualQuery` map (we saw `[RX]` tags in the Highrise dump). Disambiguate from the **fields array** structurally: its entries point to structs whose first slot is a *name cstr* and contain *no* RX pointer. Rejected: reorder Phase-2-before-Phase-1 (moves the chicken-and-egg; Phase 2 method discovery may itself need `klass_methods`/absent FFI).
+
+### Reframed scope
+Foundation is SOUND (kernel-witnessed regions, strong `.dll`-image validator, finest-granularity stride, well-founded root). Rot is CONCENTRATED in: (1) Phase-1 probes reading hardcoded sub-offsets through weak thresholds (cascade), (2) unverified-status not propagating to consumers. Redesign shrinks from "rebuild calibration" → "replace cascading probes with non-circular structural recognizers + propagate unverified-status (fail-closed to consumers)."
+
 ## Next artifact
-The **triangulation map**: for the root and each Phase-1/2 offset, list the ≥2 derivations that establish it, tag the foundation each shares, and mark which need an orthogonal-mechanism witness (per the table above). Build the foundation cross-checks FIRST; everything downstream inherits their honesty.
+The **triangulation map**: for the root and each Phase-1/2 offset, list the ≥2 derivations that establish it, tag the foundation each shares, mark which need an orthogonal witness. Foundation now largely verified — focus the map on the offset probes (methods/static_fields/type_def) and the out-of-band anchor that cross-checks table+stride+region from one heap-derived klass.
