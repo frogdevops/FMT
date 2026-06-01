@@ -8,7 +8,11 @@ use crate::internals::calibration::ProbeOutcome;
 use crate::internals::config::Il2CppConfig;
 use crate::internals::ffi::Il2CppApi;
 
-const MIN_RATIO: f32 = 0.90;
+// MIN_RATIO (0.90) was copied from klass_layout.rs during initial scaffolding, but
+// this probe uses exact match (matches == 2) rather than a ratio gate — there are
+// only 2 anchor params per anchor method, so a ratio threshold adds no value here.
+// klass_layout.rs and type_discrim.rs still use MIN_RATIO against larger populations.
+// Deleted to remove the dead-const warning.
 
 /// ParameterInfo stride: probe via String::PadLeft(Int32, Char).
 /// param[0] type is Int32 (tc=0x08), param[1] type is Char (tc=0x03).
@@ -60,7 +64,7 @@ pub fn probe_param_info(
 
     // Read tc from a candidate type ptr.
     let read_tc = |type_ptr: usize| -> Option<u8> {
-        let chunk = map.read_u64(type_ptr + klass_type_def_off - klass_type_def_off + discrim_read_at)?;
+        let _chunk = map.read_u64(type_ptr + klass_type_def_off - klass_type_def_off + discrim_read_at)?;
         // simpler: read from type_ptr directly; klass_type_def_off doesn't apply here
         let chunk = map.read_u64(type_ptr + discrim_read_at)?;
         Some(((chunk >> discrim_shift) & 0xFF) as u8)

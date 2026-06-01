@@ -2,8 +2,6 @@
 //! the Rust dispatcher reads. Field offsets must match the shim asm in
 //! `shim.rs` byte-for-byte — every change here is a change there.
 
-use core::ffi::c_void;
-
 #[repr(C)]
 pub struct RegArgs {
     /// From R10 (set by the thunk).                   Offset 0

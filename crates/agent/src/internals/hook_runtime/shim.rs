@@ -63,8 +63,8 @@ extern "C" {
     pub fn universal_shim();
 }
 
-/// Dispatched-into Rust function. The shim calls this with
-/// (method_id: u64, regs: *mut RegArgs). Body lives in dispatcher.rs.
+// Dispatched-into Rust function. The shim calls this with
+// (method_id: u64, regs: *mut RegArgs). Body lives in dispatcher.rs.
 #[allow(dead_code)]
 extern "system" {
     pub fn dispatch_rust(method_id: u64, regs: *mut crate::internals::hook_runtime::regargs::RegArgs);

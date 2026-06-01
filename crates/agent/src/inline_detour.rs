@@ -20,9 +20,41 @@ impl Hook {
         self.trampoline
     }
 
+    /// Verify that the bytes at `self.target` still encode the `mov rax, detour; jmp rax`
+    /// sequence that `install` wrote.  Returns `false` if another patcher has overwritten
+    /// our hook — restoring blindly in that situation would corrupt their patch.
+    ///
+    /// Encoding written by `install` (12 bytes):
+    ///   48 B8 <detour u64 LE>   — MOV RAX, imm64
+    ///   FF E0                   — JMP RAX
+    pub fn verify_patched(&self) -> bool {
+        if self.target == 0 { return false; }
+        // SAFETY: target is a valid executable page we previously patched.
+        let b = unsafe { std::slice::from_raw_parts(self.target as *const u8, 12) };
+        // Check REX.W MOV RAX opcode prefix
+        if b[0] != 0x48 || b[1] != 0xB8 { return false; }
+        // Check the embedded 64-bit immediate matches the detour address
+        let embedded = usize::from_le_bytes(b[2..10].try_into().unwrap());
+        if embedded != self.detour { return false; }
+        // Check JMP RAX
+        b[10] == 0xFF && b[11] == 0xE0
+    }
+
     pub unsafe fn remove(&mut self) {
         if self.target == 0 {
             return;
+        }
+
+        // Substrate-honesty check: warn if our patch bytes are no longer present.
+        // This means another patcher overwrote us; restoring original_bytes could
+        // corrupt their hook.  We still restore because we own the trampoline, but
+        // the log entry gives the operator a clear signal to investigate ordering.
+        if !self.verify_patched() {
+            crate::paths::log(&format!(
+                "Hook::remove WARNING — bytes at {:#x} no longer point to detour {:#x}; \
+                 another patcher may have overwritten our hook",
+                self.target, self.detour
+            ));
         }
 
         let len = self.original_bytes.len();

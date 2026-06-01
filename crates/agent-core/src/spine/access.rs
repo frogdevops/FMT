@@ -20,7 +20,7 @@ use crate::spine::value::MemValue;
 use crate::spine::error::MemError;
 use crate::spine::addr::{MemAddr, ReadWrite};
 use crate::spine::field_info::FieldInfo;
-use crate::spine::handles::{FieldAddr, KlassPtr, MethodPtr};
+use crate::spine::handles::{FieldAddr, Instance, KlassPtr, MethodPtr};
 use crate::spine::{mem_backend, metadata_backend};
 
 /// Defensive cap: real il2cpp classes never have this many fields. Mirrors
@@ -28,8 +28,9 @@ use crate::spine::{mem_backend, metadata_backend};
 const MAX_FIELDS_PER_CLASS: usize = 256;
 
 /// Defensive cap: real il2cpp classes never have this many methods. Mirrors
-/// the `find_method` cap in `agent::internals::api`.
-const MAX_METHODS_PER_CLASS: usize = 4096;
+/// the `find_method` cap in `agent::internals::api`. Exposed `pub` so the
+/// dumper can reference the same value when emitting its honesty signal.
+pub const MAX_METHODS_PER_CLASS: usize = 4096;
 
 /// Read a typed value of `T` from this handle.
 pub trait Read<T: MemValue> {
@@ -127,10 +128,12 @@ impl Iterator for FieldInfoIter {
         }
         self.cursor = raw.next_cursor;
         Some(FieldInfo {
-            name_ptr: raw.name_ptr,
-            offset:   raw.offset,
-            val_type: raw.val_type,
-            token:    raw.token,
+            name_ptr:  raw.name_ptr,
+            offset:    raw.offset,
+            val_type:  raw.val_type,
+            token:     raw.token,
+            is_static: raw.is_static,
+            type_ptr:  raw.type_ptr,
         })
     }
 }
@@ -177,5 +180,141 @@ impl Iter<MethodPtr> for KlassPtr {
             cursor: 0,
             limit:  MAX_METHODS_PER_CLASS,
         }
+    }
+}
+
+// ── KlassPtr instance iteration via scan_backend ────────────────────────────
+
+/// Lightweight (2-usize, `Copy`) iterator state for `Iter<Instance> for
+/// KlassPtr`. The actual scan + structural validation lives in the agent
+/// crate behind the `scan_backend::{NextMatchFn, ValidateFn}` vtable.
+///
+/// `cursor` is an OPAQUE, backend-owned cursor (e.g. an index into the
+/// backend's cached scan results), NOT a memory address. The iterator holds
+/// it by value and passes `&mut self.cursor` so the backend can advance it
+/// in place across calls. This intentionally differs from the metadata
+/// backend's value-in/value-out cursor convention because scan results are
+/// streamed from a backend-side cache.
+///
+/// Per the B-6b spec: validation is UNIVERSAL/structural (no per-klass logic).
+/// Backend's `next_match` yields candidates; `validate` filters out non-instance
+/// coincidental matches via region check + alignment + klass_of + klass-shape.
+#[derive(Debug, Clone, Copy)]
+pub struct InstanceIter {
+    klass:  usize,
+    cursor: usize,
+}
+
+impl Iterator for InstanceIter {
+    type Item = Instance;
+
+    fn next(&mut self) -> Option<Instance> {
+        loop {
+            let before = self.cursor;
+            let candidate = crate::spine::scan_backend::next_match(
+                self.klass,
+                &mut self.cursor,
+            )?;
+            // Liveness guard: a well-behaved backend MUST advance `cursor` on a
+            // `Some(_)` return. If it didn't, terminate rather than spin forever
+            // — this iterator runs on the game thread (game frozen), so a
+            // non-advancing backend would be a hard freeze, not slow output.
+            // Mirrors FieldInfoIter's non-advancing cursor guard.
+            if self.cursor <= before {
+                return None;
+            }
+            if crate::spine::scan_backend::validate(candidate, self.klass) {
+                return Some(Instance::from_raw(candidate as u64));
+            }
+            // Validation failed: try the next candidate (silent skip, no log spam).
+        }
+    }
+}
+
+impl Iter<Instance> for KlassPtr {
+    type Iter = InstanceIter;
+    fn iter(&self) -> Self::Iter {
+        InstanceIter {
+            klass:  self.as_u64() as usize,
+            cursor: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod instance_iter_tests {
+    use super::*;
+    use crate::spine::scan_backend;
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    // Klass sentinels selecting a scenario from the single shared mock backend.
+    // (All test modules in this crate share the same global scan_backend
+    // statics, so we parameterize ONE backend by target_klass rather than
+    // registering several.)
+    const KLASS_MIXED:   usize = 0xDEAD_BEEF; // 4 candidates, 2 valid
+    const KLASS_EMPTY:   usize = 0xE0;        // backend yields nothing
+    const KLASS_ALL_BAD: usize = 0xBAD;       // 4 candidates, none valid
+
+    fn test_next_match(target: usize, cursor: &mut usize) -> Option<usize> {
+        let candidates: &[usize] = match target {
+            KLASS_EMPTY => &[],
+            _           => &[0x1000, 0x2000, 0x3000, 0x4000],
+        };
+        if *cursor >= candidates.len() {
+            return None;
+        }
+        let v = candidates[*cursor];
+        *cursor += 1;
+        Some(v)
+    }
+
+    fn test_validate(addr: usize, target: usize) -> bool {
+        match target {
+            KLASS_ALL_BAD => false,
+            _             => addr == 0x1000 || addr == 0x3000,
+        }
+    }
+
+    fn init_test_backend() {
+        INIT.call_once(|| {
+            scan_backend::register(test_next_match, test_validate);
+        });
+    }
+
+    #[test]
+    fn instance_iter_yields_only_validated_candidates() {
+        init_test_backend();
+        let klass = KlassPtr::from_raw(KLASS_MIXED as u64);
+        let yielded: Vec<u64> =
+            <KlassPtr as Iter<Instance>>::iter(&klass).map(|i| i.as_u64()).collect();
+        assert_eq!(yielded, vec![0x1000, 0x3000]);
+    }
+
+    #[test]
+    fn instance_iter_terminates_when_backend_returns_none() {
+        init_test_backend();
+        let klass = KlassPtr::from_raw(KLASS_MIXED as u64);
+        let count = <KlassPtr as Iter<Instance>>::iter(&klass).count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn instance_iter_empty_scan_yields_nothing() {
+        init_test_backend();
+        let klass = KlassPtr::from_raw(KLASS_EMPTY as u64);
+        let count = <KlassPtr as Iter<Instance>>::iter(&klass).count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn instance_iter_all_invalid_terminates_cleanly() {
+        init_test_backend();
+        let klass = KlassPtr::from_raw(KLASS_ALL_BAD as u64);
+        // All 4 candidates fail validation; iterator must terminate (the backend
+        // advances the cursor each call), yielding zero — not spin forever.
+        let count = <KlassPtr as Iter<Instance>>::iter(&klass).count();
+        assert_eq!(count, 0);
     }
 }

@@ -22,10 +22,12 @@ fn field_addr_is_copy_and_eq() {
 #[test]
 fn field_info_is_copy_and_struct_fields_accessible() {
     let fi = FieldInfo {
-        name_ptr: 0xdeadbeef,
-        offset:   0x10,
-        val_type: ValType::U64,
-        token:    0x04000001,
+        name_ptr:  0xdeadbeef,
+        offset:    0x10,
+        val_type:  ValType::U64,
+        token:     0x04000001,
+        is_static: false,
+        type_ptr:  0,
     };
     let copy = fi;
     assert_eq!(copy.name_ptr, 0xdeadbeef);

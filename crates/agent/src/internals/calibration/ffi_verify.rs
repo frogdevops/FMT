@@ -4,12 +4,18 @@
 use crate::internals::calibration::anchors::local_find_class;
 use crate::internals::ffi::{cstr_to_string, Il2CppApi, Il2CppClass};
 
+/// Verification result for a single FFI export.
+///
+/// NOTE: a `Crashed` variant was previously here to flag FFI calls that crashed
+/// mid-verify (SEH-trapped). FFI crash detection was never wired — it needs
+/// Windows SEH (__try/__except) integration, which is its own brick (targeted
+/// for a later substrate-stability pass). Until then, FFI verify treats a crash
+/// as process death (handled by the OS). Re-add the variant when SEH lands.
 #[derive(Debug)]
 pub enum Verified {
     Ok(String),                                    // detail string for log
     Absent,
     Mismatch { expected: String, got: String },
-    Crashed,
 }
 
 #[derive(Debug)]
@@ -53,7 +59,6 @@ fn line(name: &str, v: &Verified) -> String {
         Verified::Absent     => format!("  {:<22} ABSENT (degraded capability)", name),
         Verified::Mismatch { expected, got } => format!(
             "❌ {:<22} MISMATCH: expected {:?}, got {:?}", name, expected, got),
-        Verified::Crashed    => format!("❌ {:<22} CRASHED on verification call", name),
     }
 }
 
@@ -133,12 +138,12 @@ pub fn run_verification(
 
     let type_get_name = if int32.is_null() {
         Verified::Absent
-    } else { unsafe {
+    } else {
         // type_get_name takes Il2CppType*, not Il2CppClass* — we need the
         // klass's byval_arg. For simplicity we just verify the FFI was bound
         // (we'll see "OK" if the dumper has been producing type names).
         Verified::Ok("(verified via dumper output; not directly probed)".into())
-    }};
+    };
 
     let thread_attach = match api.thread_attach {
         Some(_) => Verified::Ok("resolved".into()),
