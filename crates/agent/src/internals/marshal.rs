@@ -96,7 +96,7 @@ impl InvokeContext {
             InvokeArg::Prim(v) => {
                 let bytes = v.encode();
                 self.arg_slabs.push(bytes);
-                let ptr = self.arg_slabs.last_mut().unwrap().as_mut_ptr() as *mut c_void;
+                let ptr = self.arg_slabs.last_mut().expect("arg_slabs invariant: push precedes last_mut").as_mut_ptr() as *mut c_void;
                 self.args_ptrs.push(ptr);
                 Ok(())
             }
@@ -105,7 +105,7 @@ impl InvokeContext {
                 // We still slab the u64 so args_ptrs entries are all heap-stable.
                 let bytes = h.as_u64().to_le_bytes().to_vec();
                 self.arg_slabs.push(bytes);
-                let ptr = self.arg_slabs.last_mut().unwrap().as_mut_ptr() as *mut c_void;
+                let ptr = self.arg_slabs.last_mut().expect("arg_slabs invariant: push precedes last_mut").as_mut_ptr() as *mut c_void;
                 self.args_ptrs.push(ptr);
                 Ok(())
             }
@@ -128,13 +128,13 @@ impl InvokeContext {
                 // are heap-stable.
                 let bytes = (il2_str as u64).to_le_bytes().to_vec();
                 self.arg_slabs.push(bytes);
-                let ptr = self.arg_slabs.last_mut().unwrap().as_mut_ptr() as *mut c_void;
+                let ptr = self.arg_slabs.last_mut().expect("arg_slabs invariant: push precedes last_mut").as_mut_ptr() as *mut c_void;
                 self.args_ptrs.push(ptr);
                 Ok(())
             }
             InvokeArg::Struct(bytes) => {
                 self.arg_slabs.push(bytes.clone());
-                let ptr = self.arg_slabs.last_mut().unwrap().as_mut_ptr() as *mut c_void;
+                let ptr = self.arg_slabs.last_mut().expect("arg_slabs invariant: push precedes last_mut").as_mut_ptr() as *mut c_void;
                 self.args_ptrs.push(ptr);
                 Ok(())
             }
@@ -257,7 +257,6 @@ pub fn invoke_method(
 
 use crate::internals::hook_runtime::regargs::RegArgs;
 
-const METHOD_ATTRIBUTE_STATIC_BIT: u32 = 0x10;
 
 /// Convert captured RegArgs to InvokeArg[] for the wasm handler.
 /// Respects the "this-shift" for instance methods (first physical reg is `this`,

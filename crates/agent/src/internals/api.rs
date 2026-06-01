@@ -13,6 +13,12 @@ use crate::external::{api as ext, cache};
 use crate::internals::ctx;
 use crate::internals::ffi::{cstr_to_string, Il2CppClass};
 
+/// `FIELD_ATTRIBUTE_STATIC` bit in il2cpp's field type-attribute chunk (low byte
+/// of the discriminator chunk read at `il2cpp_type_discrim_read_at`). A field is
+/// declared `static` iff this bit is set. (il2cpp shares the same 0x10 bit value
+/// across METHOD and FIELD attribute encodings, hence the name.)
+pub(crate) const METHOD_ATTRIBUTE_STATIC_BIT: u32 = 0x10;
+
 /// Search the live class table for a class whose name (or "Namespace::Name")
 /// matches `name`. Returns `Some(KlassPtr)` when found, `None` otherwise.
 pub fn find_class(name: &str) -> Option<KlassPtr> {
@@ -100,7 +106,7 @@ pub fn field_info(klass: KlassPtr, name: &str) -> Option<(u32, ValType, bool)> {
             // FIELD_ATTRIBUTE_STATIC (0x10) lives in the low byte of the same chunk
             // that type_tc reads — same source, same offset, matching fields_at/static_field.
             let chunk = cache::read_u64(type_ptr + c.cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
-            let is_static = (chunk & 0x10) != 0;
+            let is_static = (chunk & METHOD_ATTRIBUTE_STATIC_BIT as u64) != 0;
             found = Some((offset, vt, is_static));
             true
         } else {
@@ -154,7 +160,7 @@ pub fn static_field(klass: KlassPtr, name: &str) -> Option<MemAddr<ReadWrite>> {
     for_each_field(k, |fname, offset, type_ptr| {
         if fname == name {
             let chunk = cache::read_u64(type_ptr + c.cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
-            if chunk & 0x10 != 0 {
+            if chunk & METHOD_ATTRIBUTE_STATIC_BIT as u64 != 0 {
                 let raw = static_base + offset as u64;
                 // SAFETY: static_base lives in a writable region; the static-attr
                 // bit confirms this field address is in that region.
@@ -323,7 +329,7 @@ fn fields_at(klass: usize, cursor: usize) -> Option<agent_core::spine::metadata_
         let vt = valtype_from_tc(tc).unwrap_or(ValType::U64);
         // FIELD_ATTRIBUTE_STATIC (0x10) lives in the low byte of the SAME chunk
         // that `static_field` masks (api.rs:150). Identical source/offset/mask.
-        let is_static = (chunk & 0x10) != 0;
+        let is_static = (chunk & METHOD_ATTRIBUTE_STATIC_BIT as u64) != 0;
         return Some(agent_core::spine::metadata_backend::FieldInfoRaw {
             name_ptr,
             offset,

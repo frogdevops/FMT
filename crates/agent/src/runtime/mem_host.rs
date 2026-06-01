@@ -431,7 +431,7 @@ fn host_hook_arg(mut caller: wasmi::Caller<'_, HostState>, arg_idx: i32, out_buf
     }
 }
 
-fn host_hook_set_arg(mut caller: wasmi::Caller<'_, HostState>, arg_idx: i32, val_buf: i32, val_len: i32) -> i32 {
+fn host_hook_set_arg(caller: wasmi::Caller<'_, HostState>, arg_idx: i32, val_buf: i32, val_len: i32) -> i32 {
     let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) { Some(m) => m, None => return -3 };
     let mut buf = vec![0u8; val_len as usize];
     if mem.read(&caller, val_buf as usize, &mut buf).is_err() { return -1; }
@@ -457,7 +457,7 @@ fn host_call_original(mut caller: wasmi::Caller<'_, HostState>, out_buf: i32, ou
     }
 }
 
-fn host_hook_set_return(mut caller: wasmi::Caller<'_, HostState>, val_buf: i32, val_len: i32) -> i32 {
+fn host_hook_set_return(caller: wasmi::Caller<'_, HostState>, val_buf: i32, val_len: i32) -> i32 {
     let mem = match caller.get_export("memory").and_then(|e| e.into_memory()) { Some(m) => m, None => return -3 };
     let mut buf = vec![0u8; val_len as usize];
     if mem.read(&caller, val_buf as usize, &mut buf).is_err() { return -1; }

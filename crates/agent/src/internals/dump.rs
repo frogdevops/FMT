@@ -18,7 +18,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::model::{Dump, DumpedClass};
 
@@ -29,10 +28,22 @@ use crate::paths::log;
 use crate::external::region_map::{RegionMap, Tunables};
 use crate::internals::resolve::{il2cpp_type_name, GenericCtx, TypeMaps};
 
-/// Cached offset of `klass->generic_class`, probed at runtime from the
-/// Il2CppGenericClass::cached_class back-reference.  Once calibrated this
-/// is used instead of cfg.klass_generic_class.
-static PROBED_GC_OFF: AtomicUsize = AtomicUsize::new(0);
+// Generic type-argument resolution lives entirely in `resolve.rs`:
+//   * GENERICINST fields (e.g. `List<System.Int32>`) resolve via the
+//     `Il2CppGenericClass*` read from the *type pointer's own data field*
+//     (resolve.rs `il2cpp_type_name_depth`, type-code 0x15) — no klass
+//     offset is consulted.
+//   * VAR/MVAR params (e.g. `T` inside `List<T>`) resolve via the enclosing
+//     class's `GenericCtx`, produced by `read_generic_context` below, which
+//     reads `klass + cfg.klass_generic_class` (a version-aware offset, default
+//     0x48). resolve.rs `resolve_var_param` substitutes the concrete arg.
+// There was a `PROBED_GC_OFF` static + `calibrate_generic_class_offset`
+// here that was meant to runtime-probe this offset for obfuscated builds, but
+// it never stored a result (it only logged raw memory layout) and its return
+// was discarded — so the probed branch was permanently dead and VAR/MVAR
+// already ran on `cfg.klass_generic_class`. Removed (Task 21): deletion is
+// behavior-identical (same offset used) and a half-wired probe storing an
+// unvalidated offset would have been *less* safe than the config fallback.
 
 /// Render one class block: header line + indented field lines.
 fn format_class(c: &DumpedClass, fields: &[String]) -> Vec<String> {
@@ -100,41 +111,6 @@ fn build_type_index_reverse(meta: &Dump) -> HashMap<u32, (String, String)> {
 /// runtime-field count for the summary header. `metadata_result` is optional —
 /// when present, we merge its field/method shape in; when absent, we emit only
 /// what the runtime walk found.
-fn calibrate_generic_class_offset(
-    table_base: usize,
-    table_count: usize,
-    map: &RegionMap,
-    api: &Il2CppApi,
-    cfg: &Il2CppConfig,
-) -> usize {
-    for i in 0..table_count.min(10) {
-        let addr = table_base.wrapping_add(i * cfg.class_table_step);
-        let Some(cls_raw) = map.read_u64(addr) else { continue };
-        let cls = cls_raw as usize;
-        if cls == 0 { continue; }
-        let n = unsafe { cstr_to_string((api.class_get_name)(cls as *mut c_void)) };
-        if n.is_empty() { continue; }
-        let mut out = String::new();
-        for off in (0x00..=0x88).step_by(8) {
-            let val = map.read_u64(cls + off).unwrap_or(0) as usize;
-            if val == 0 || val == cls { continue; }
-            let v0 = map.read_u64(val).unwrap_or(0);
-            let v8 = map.read_u64(val + 0x8).unwrap_or(0);
-            let v16 = map.read_u64(val + 0x10).unwrap_or(0);
-            let v24 = map.read_u64(val + 0x18).unwrap_or(0);
-            let v32 = map.read_u64(val + 0x20).unwrap_or(0);
-            out.push_str(&format!(" +{:02x}:{:#x}[{:#x},{:#x},{:#x},{:#x},{:#x}]",
-                off, val, v0, v8, v16, v24, v32));
-        }
-        if !out.is_empty() {
-            log(&format!("  CALIB cls={:#x} {} {}", cls, n, out));
-        }
-    }
-
-    // Generic context not needed — VAR/MVAR resolution works without it.
-    cfg.klass_generic_class
-}
-
 pub fn build_internals_lines(
     table_base: usize,
     table_count: usize,
@@ -145,10 +121,6 @@ pub fn build_internals_lines(
     metadata_result: Option<&MetadataResult>,
     types_array: Option<usize>,
 ) -> (Vec<String>, usize) {
-    // Calibrate the klass→generic_class offset at runtime so we don't rely
-    // on version-guessed values (which fail for obfuscated builds).
-    calibrate_generic_class_offset(table_base, table_count, map, api, cfg);
-
     let meta_index = metadata_result.map(|mr| build_metadata_index(&mr.dump));
 
     let type_index_to_name: HashMap<u32, (String, String)> = metadata_result
@@ -341,11 +313,9 @@ pub fn build_internals_lines(
 /// Returns `Some(GenericCtx)` when the class is a generic instantiation with
 /// resolvable type args, or `None` for non-generic classes.
 fn read_generic_context(cls: usize, map: &RegionMap, cfg: &Il2CppConfig) -> Option<GenericCtx> {
-    // Use probed offset if available (runtime calibration), fall back to config.
-    let gc_off = {
-        let p = PROBED_GC_OFF.load(Ordering::Relaxed);
-        if p != 0 { p } else { cfg.klass_generic_class }
-    };
+    // Version-aware klass→generic_class offset (default 0x48). See the
+    // generic-resolution note near the top of this file.
+    let gc_off = cfg.klass_generic_class;
     // Il2CppGenericClass: type@+0x00, class_inst@+0x08, cached_class@+0x18
     let gc = map.read_u64(cls + gc_off)? as usize;
     let inst = map.read_u64(gc + 0x8)? as usize;
@@ -381,7 +351,7 @@ fn read_field_is_static(type_ptr: usize, cfg: &Il2CppConfig, map: &RegionMap) ->
         return false;
     }
     let chunk = map.read_u64(type_ptr + cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
-    (chunk & 0x10) != 0
+    (chunk & crate::internals::api::METHOD_ATTRIBUTE_STATIC_BIT as u64) != 0
 }
 
 /// Collect a class's live fields plus a flag indicating the field-walk cap was
@@ -481,7 +451,7 @@ fn collect_runtime_fields(
                 };
                 // FIELD_ATTRIBUTE_STATIC (0x10) lives in the low byte of the same
                 // `chunk` read above — identical source/offset/mask to fields_at.
-                let is_static = (chunk & 0x10) != 0;
+                let is_static = (chunk & crate::internals::api::METHOD_ATTRIBUTE_STATIC_BIT as u64) != 0;
                 rt_fields.push(RtField { name: fname, type_name: ftype, offset, token, is_static });
             }
         }
