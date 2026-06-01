@@ -197,6 +197,12 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     if std::env::var("FROG_EXPORT_DUMP").is_ok() {
         crate::diagnostics::export_dump::run_export_dump_probe();
     }
+    // Bedrock investigation: container-first structural recognizer — proves the
+    // non-circular methods-array discovery + sub-offset derivation (no hardcoded
+    // sub-offsets), sampling klasses from the table structurally. Crash-safe.
+    if std::env::var("FROG_RECOGNIZER_PROBE").is_ok() {
+        crate::diagnostics::klass_probe::run_recognizer_probe(&map, table_base, table_count);
+    }
 
     // B-6a: ensure scripts/ folder exists, perform initial load if a script
     // is already present at startup, then spawn the watcher.

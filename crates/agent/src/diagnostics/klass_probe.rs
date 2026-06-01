@@ -13,6 +13,7 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use crate::external::cache;
+use crate::external::region_map::RegionMap;
 use crate::internals::api;
 use crate::internals::ctx;
 use crate::paths::log;
@@ -155,4 +156,188 @@ pub fn run_member_probe() {
         log(&format!("  f[{:>2}] \"{}\" off={:#x} tc={:#x} typechunk={:#018x}", i, name, offset, tc, chunk));
     }
     log("=== end MEMBER PROBE ===");
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// RECOGNIZER PROBE (opt-in `FROG_RECOGNIZER_PROBE`)
+//
+// Proves the container-first, NON-CIRCULAR discovery the bedrock redesign rests
+// on: find the `methods` array by intrinsic structure — a pointer-array whose
+// entries are MethodInfo-shaped (each contains >=1 executable (RX) pointer AND
+// >=1 pointer back to the owning klass) — then DERIVE method_pointer_off /
+// method_klass_off / method_name_off by classifying that MethodInfo's own slots.
+// Zero hardcoded sub-offsets, so it cannot cascade the way the current
+// `probe_klass_methods` does (it assumes methodPointer @ +0x08 and false-fails
+// when that assumption is wrong — e.g. PW's real method_pointer_off is 0x0).
+//
+// Crash-safe: every read goes through the passed RegionMap (VirtualQuery-backed,
+// bounds-checked, never faults). Klasses are sampled from the table structurally
+// (no find_class-by-name, which 404s across games and chases FFI — the thing
+// that crashed the earlier probe on PW).
+// ───────────────────────────────────────────────────────────────────────────
+
+fn is_exec(addr: usize) -> bool {
+    matches!(protect_of(addr), "RX" | "RWX")
+}
+
+/// A struct at `p` is MethodInfo-shaped if, within its first 0x60 bytes, it holds
+/// >=1 executable pointer (compiled code) AND >=1 pointer equal to `klass` (the
+/// declaring-class back-pointer). No sub-offset is assumed.
+fn looks_methodinfo(map: &RegionMap, p: usize, klass: usize) -> bool {
+    let (mut rx, mut back) = (false, false);
+    let mut j = 0usize;
+    while j < 0x60 {
+        if let Some(w) = map.read_u64(p + j) {
+            let wu = w as usize;
+            if wu == klass {
+                back = true;
+            } else if wu >= 0x10_0000 && is_exec(wu) {
+                rx = true;
+            }
+        }
+        j += 8;
+    }
+    rx && back
+}
+
+/// Find the `methods` offset(s) by structure: klass+off → array of pointers
+/// whose first two entries are both MethodInfo-shaped for THIS klass. Two
+/// consecutive MethodInfo-shaped back-pointers to the same klass do not occur
+/// by chance, so this needs no candidate window and no sub-offset.
+fn recognize_methods(map: &RegionMap, klass: usize) -> Vec<usize> {
+    let mut hits = Vec::new();
+    let mut off = 0x40usize;
+    while off < 0x108 {
+        if let Some(arr) = map.read_u64(klass + off) {
+            let arr = arr as usize;
+            let e0 = map.read_u64(arr).unwrap_or(0) as usize;
+            let e1 = map.read_u64(arr + 8).unwrap_or(0) as usize;
+            if e0 >= 0x10_0000
+                && e1 >= 0x10_0000
+                && looks_methodinfo(map, e0, klass)
+                && looks_methodinfo(map, e1, klass)
+            {
+                hits.push(off);
+            }
+        }
+        off += 8;
+    }
+    hits
+}
+
+/// Given the first MethodInfo `mi`, derive sub-offsets by classifying its slots:
+/// the executable-ptr slot → method_pointer_off; the ==klass slot →
+/// method_klass_off; the readable-name slot → method_name_off. First of each.
+fn derive_method_suboffsets(
+    map: &RegionMap,
+    mi: usize,
+    klass: usize,
+) -> (Option<usize>, Option<usize>, Option<usize>) {
+    let (mut mp, mut mk, mut mn) = (None, None, None);
+    let mut j = 0usize;
+    while j < 0x60 {
+        if let Some(w) = map.read_u64(mi + j) {
+            let wu = w as usize;
+            if mk.is_none() && wu == klass {
+                mk = Some(j);
+            } else if mp.is_none() && wu >= 0x10_0000 && is_exec(wu) {
+                mp = Some(j);
+            } else if mn.is_none() {
+                if let Some(s) = map.read_name_strict(wu) {
+                    if s.len() >= 2 && s.len() < 64 {
+                        mn = Some(j);
+                    }
+                }
+            }
+        }
+        j += 8;
+    }
+    (mp, mk, mn)
+}
+
+/// Tally a value into a (value, count) vote list.
+fn tally(v: &mut Vec<(usize, u32)>, k: usize) {
+    if let Some(e) = v.iter_mut().find(|e| e.0 == k) {
+        e.1 += 1;
+    } else {
+        v.push((k, 1));
+    }
+}
+
+fn fmt_votes(v: &[(usize, u32)]) -> String {
+    v.iter()
+        .map(|(o, c)| format!("{:#x}×{}", o, c))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+pub fn run_recognizer_probe(map: &RegionMap, table_base: usize, table_count: usize) {
+    log("=== RECOGNIZER PROBE (container-first, zero hardcoded sub-offsets) ===");
+    const STEP: usize = 8;
+    const WANT: usize = 12;
+    let mut tested = 0usize;
+    let mut methods_votes: Vec<(usize, u32)> = Vec::new();
+    let mut mp_votes: Vec<(usize, u32)> = Vec::new();
+    let mut mk_votes: Vec<(usize, u32)> = Vec::new();
+    let mut mn_votes: Vec<(usize, u32)> = Vec::new();
+
+    let mut i = 0usize;
+    while tested < WANT && i < table_count {
+        let slot = table_base + i * STEP;
+        i += 1;
+        let k = match map.read_u64(slot) {
+            Some(v) if v != 0 => v as usize,
+            _ => continue,
+        };
+        // Structural validity (the verified-sound root validator).
+        let (name, _ns) = match map.class_fields(k) {
+            Some(x) => x,
+            None => continue,
+        };
+        let m_hits = recognize_methods(map, k);
+        if m_hits.is_empty() {
+            continue; // skip classes with no recognizable methods array (0-method types)
+        }
+        tested += 1;
+        let mo = m_hits[0];
+        let arr = map.read_u64(k + mo).unwrap_or(0) as usize;
+        let mi0 = map.read_u64(arr).unwrap_or(0) as usize;
+        let (mp, mk, mn) = derive_method_suboffsets(map, mi0, k);
+        tally(&mut methods_votes, mo);
+        if let Some(v) = mp {
+            tally(&mut mp_votes, v);
+        }
+        if let Some(v) = mk {
+            tally(&mut mk_votes, v);
+        }
+        if let Some(v) = mn {
+            tally(&mut mn_votes, v);
+        }
+        log(&format!(
+            "  {:<28} methods=[{}] mp_off={} mk_off={} mn_off={}",
+            short(&name),
+            m_hits
+                .iter()
+                .map(|o| format!("{:#x}", o))
+                .collect::<Vec<_>>()
+                .join(","),
+            mp.map_or("?".into(), |v| format!("{:#x}", v)),
+            mk.map_or("?".into(), |v| format!("{:#x}", v)),
+            mn.map_or("?".into(), |v| format!("{:#x}", v)),
+        ));
+    }
+
+    methods_votes.sort_by(|a, b| b.1.cmp(&a.1));
+    mp_votes.sort_by(|a, b| b.1.cmp(&a.1));
+    mk_votes.sort_by(|a, b| b.1.cmp(&a.1));
+    mn_votes.sort_by(|a, b| b.1.cmp(&a.1));
+    log(&format!("  --- consensus over {} klasses ---", tested));
+    log(&format!("  methods_off                 : {}", fmt_votes(&methods_votes)));
+    log(&format!("  method_pointer_off (DERIVED): {}", fmt_votes(&mp_votes)));
+    log(&format!("  method_klass_off   (DERIVED): {}", fmt_votes(&mk_votes)));
+    log(&format!("  method_name_off    (DERIVED): {}", fmt_votes(&mn_votes)));
+    log("  baseline that CASCADES: probe_klass_methods assumes methodPointer @ +0x08");
+    log("  → PROOF: if methods_off consensus is unanimous AND derived method_pointer_off != 0x08,");
+    log("    the structural recognizer is independent of the cascade and the bug is confirmed.");
+    log("=== end RECOGNIZER PROBE ===");
 }

@@ -135,5 +135,39 @@ Recognize the **methods array** by intrinsic structure, zero calibrated sub-offs
 ### Reframed scope
 Foundation is SOUND (kernel-witnessed regions, strong `.dll`-image validator, finest-granularity stride, well-founded root). Rot is CONCENTRATED in: (1) Phase-1 probes reading hardcoded sub-offsets through weak thresholds (cascade), (2) unverified-status not propagating to consumers. Redesign shrinks from "rebuild calibration" → "replace cascading probes with non-circular structural recognizers + propagate unverified-status (fail-closed to consumers)."
 
-## Next artifact
-The **triangulation map**: for the root and each Phase-1/2 offset, list the ≥2 derivations that establish it, tag the foundation each shares, mark which need an orthogonal witness. Foundation now largely verified — focus the map on the offset probes (methods/static_fields/type_def) and the out-of-band anchor that cross-checks table+stride+region from one heap-derived klass.
+## Triangulation Map
+
+**The cascade-inversion principle:** find the CONTAINER by intrinsic structure, then DERIVE its sub-offsets by classifying the container's slots. Never assume a sub-offset to validate a container (that is the `klass_methods` bug). Dependency order: foundation (verified) → klass containers → sub-offsets-within-containers. Each fact: ≥2 independent witnesses; **agree → confident; disagree → `UNRESOLVED` (never silent fallback)**.
+
+**Foundation (verified in code — see Verification section):** stride=8 (finest-granularity dense run), region map (VirtualQuery kernel witness), root validator (`.dll`-image + name + ns). Out-of-band anchor (1 heap-derived klass) cross-checks table-membership + stride-boundary + region-agreement in one datum.
+
+| Fact | W1 (intrinsic) | W2 (independent) | Disagree → |
+|---|---|---|---|
+| `image` @0x00 | slot → struct → name ".dll" | value is **shared across many klasses** (low-cardinality); name/ns are unique | UNRESOLVED |
+| `name` @0x10 | slot → readable cstr, **unique** per klass | FFI `class_get_name` (when present) matches | UNRESOLVED |
+| `namespace` @0x18 | slot → cstr, **may be empty** (distinguisher from name) | FFI `class_get_namespace` matches | UNRESOLVED |
+| **`fields`** @0x80 | slot → const-stride ptr array; entry→struct whose **first slot is a name-cstr**, **no RX ptr** | field-name cstrs all distinct & readable | UNRESOLVED |
+| **`methods`** @0x98 | slot → const-stride ptr array; entry→struct containing **≥1 RX-region ptr** | same struct contains **≥1 ptr == owning klass** (back-ptr) | UNRESOLVED |
+| `static_fields` @0xA8? | null for MOST klasses; when present → **unique RW data region** (not shared, not code) | (no honest 2nd witness on most klasses) | **UNRESOLVED + flag to consumers** — this is the honest floor; do NOT silent-fallback |
+| `type_def` | → Il2CppTypeDefinition in metadata | (metadata) | **UNRESOLVED on no-metadata games** — dumper already routes via byval_arg/tc; never fake it |
+
+**Sub-offsets via container inversion (kills the cascade):** once `methods` array is found intrinsically, derive — by scanning each MethodInfo's slots — `method_pointer_off` = the slot that is an **RX ptr** consistently across all methods; `method_klass_off` = the slot **== klass**; `method_name_off` = the slot → **readable cstr**. Same for FieldInfo (offset = small ascending int < instance_size; name = cstr; type = ptr into type region). No assumed sub-offset; each derived by classifying real slots of a container we already proved.
+
+**type discriminator (`il2cpp_type_discrim_read_at`/`shift`):** anchor on known primitive klasses (Int32 tc=0x08, String tc=0x0E, …) via their byval_arg; the (read_at, shift) pair that makes ALL known primitives round-trip is the answer — multi-anchor consensus, intrinsic (no FFI). PW already passes this 5/5.
+
+## RECOGNIZER PROOF (live, 2026-06-01) — discovery-first VALIDATED on both games
+
+Built `FROG_RECOGNIZER_PROBE` (diagnostics/klass_probe.rs): container-first, crash-safe (RegionMap-only reads), klasses sampled structurally from the table (no find_class-by-name). Recognizes `methods` as "pointer-array whose first two entries are MethodInfo-shaped (≥1 RX ptr + ≥1 ptr == klass)" — zero candidate window, zero sub-offset assumption — then derives sub-offsets by classifying the MethodInfo's slots.
+
+**Result — 12/12 klasses, unanimous, IDENTICAL across PW and Highrise:**
+| | PW | Highrise |
+|---|---|---|
+| `methods_off` | **0x98 ×12** | **0x98 ×12** |
+| `method_pointer_off` (DERIVED) | **0x0 ×12** | **0x0 ×12** |
+| `method_klass_off` (DERIVED) | 0x20 ×12 | 0x20 ×12 |
+| `method_name_off` (DERIVED) | 0x18 ×12 | 0x18 ×12 |
+
+**Proven:** (1) the structural recognizer finds the methods array with no candidate window and no sub-offset assumption — unanimous, no ambiguity, no misses, on two different games; (2) it DERIVES `method_pointer_off = 0x0`, but `probe_klass_methods` hardcodes `+0x08` → reads the wrong slot → false-fail Highrise / false-pass PW — the **cascade bug confirmed in the open**; (3) the method sub-offsets are byte-identical PW≡Highrise — the "Highrise shifted its layout" story is dead at every level. Container-first non-circular discovery is real, not just elegant on paper.
+
+## Next deliverable
+Empirical green light given. Next: the **redesign spec** (supersedes bedrock-B1) — container-first non-circular discovery (find container by intrinsic structure → derive sub-offsets by slot classification), `UNRESOLVED` propagated to consumers (fail-closed, no silent baseline), coverage accounting — grounded in this map + the live proof. Then writing-plans → implementation. (static_fields/type_def remain the honest hard cases: no intrinsic discriminator on most klasses / no metadata on obfuscated games → must surface as UNRESOLVED, not faked.)
