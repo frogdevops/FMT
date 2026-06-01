@@ -215,9 +215,11 @@ fn unanimity_usize<F>(klasses: &[usize], probe: F, signal: &'static str) -> Fact
 where
     F: Fn(usize) -> Option<usize>,
 {
-    if klasses.len() < MIN_SAMPLES {
-        return Fact::Unresolved { reason: UnresolvedReason::NoWitness };
-    }
+    // A klass that returns None ABSTAINS (it has nothing to say — e.g. no methods
+    // array to recognize). Abstention is skipped, never a failure. Consensus is
+    // required only among klasses that produced a witness, and enough of them
+    // (>= MIN_SAMPLES) must agree. A genuine disagreement among voters is a
+    // WitnessDisagreement; zero/too-few voters is NoWitness.
     let mut agreed: Option<usize> = None;
     let mut witnesses: Vec<Witness> = Vec::new();
     for &klass in klasses {
@@ -236,18 +238,16 @@ where
                     signal,
                 });
             }
-            None => return Fact::Unresolved { reason: UnresolvedReason::NoWitness },
+            None => {} // abstain — skip
         }
     }
+    let n = witnesses.len();
     match agreed {
-        Some(v) => Fact::Resolved {
+        Some(v) if n >= MIN_SAMPLES => Fact::Resolved {
             value: v,
-            provenance: Provenance {
-                witnesses,
-                sampled: klasses.len() as u16,
-            },
+            provenance: Provenance { witnesses, sampled: n as u16 },
         },
-        None => Fact::Unresolved { reason: UnresolvedReason::NoWitness },
+        _ => Fact::Unresolved { reason: UnresolvedReason::NoWitness },
     }
 }
 
@@ -260,82 +260,66 @@ fn suboffset_consensus(
     mem: &dyn MemView,
     methods_off: usize,
 ) -> (Fact<usize>, Fact<usize>, Fact<usize>) {
-    if klasses.len() < MIN_SAMPLES {
-        let u = || Fact::Unresolved { reason: UnresolvedReason::NoWitness };
-        return (u(), u(), u());
+    // Per sub-offset, collect agreeing votes across klasses. A klass without a
+    // readable methods array, or whose MethodInfo can't yield a given slot,
+    // ABSTAINS for that sub-offset (skipped, never a failure). Each sub-offset
+    // resolves only if >= MIN_SAMPLES klasses agree.
+    type Slot = (Option<usize>, Vec<Witness>, bool); // (agreed, witnesses, still-consistent)
+
+    fn vote(slot: &mut Slot, v: Option<usize>, sig: &'static str) {
+        if !slot.2 {
+            return;
+        }
+        if let Some(v) = v {
+            if let Some(prev) = slot.0 {
+                if v != prev {
+                    slot.2 = false;
+                    return;
+                }
+            } else {
+                slot.0 = Some(v);
+            }
+            slot.1.push(Witness {
+                method: DerivationMethod::Structural,
+                observed: v as u64,
+                signal: sig,
+            });
+        }
+        // None → abstain
     }
 
-    let mut mp_agreed: Option<usize> = None;
-    let mut mk_agreed: Option<usize> = None;
-    let mut mn_agreed: Option<usize> = None;
-    let mut mp_witnesses: Vec<Witness> = Vec::new();
-    let mut mk_witnesses: Vec<Witness> = Vec::new();
-    let mut mn_witnesses: Vec<Witness> = Vec::new();
-    let mut mp_ok = true;
-    let mut mk_ok = true;
-    let mut mn_ok = true;
+    let mut mp: Slot = (None, Vec::new(), true);
+    let mut mk: Slot = (None, Vec::new(), true);
+    let mut mn: Slot = (None, Vec::new(), true);
 
     for &klass in klasses {
         let arr = match mem.read_u64(klass + methods_off) {
             Some(v) if v != 0 => v as usize,
-            _ => { mp_ok = false; mk_ok = false; mn_ok = false; break; }
+            _ => continue, // no methods array — abstain
         };
         let mi0 = match mem.read_u64(arr) {
             Some(v) if v != 0 => v as usize,
-            _ => { mp_ok = false; mk_ok = false; mn_ok = false; break; }
+            _ => continue,
         };
-        let (mp, mk, mn) = suboffsets::derive_method_suboffsets(mem, mi0, klass);
-
-        // method_pointer_off
-        if mp_ok {
-            match mp {
-                Some(v) => {
-                    if let Some(prev) = mp_agreed { if v != prev { mp_ok = false; } }
-                    else { mp_agreed = Some(v); }
-                    if mp_ok { mp_witnesses.push(Witness { method: DerivationMethod::Structural, observed: v as u64, signal: "method_pointer_off" }); }
-                }
-                None => mp_ok = false,
-            }
-        }
-        // method_klass_off
-        if mk_ok {
-            match mk {
-                Some(v) => {
-                    if let Some(prev) = mk_agreed { if v != prev { mk_ok = false; } }
-                    else { mk_agreed = Some(v); }
-                    if mk_ok { mk_witnesses.push(Witness { method: DerivationMethod::Structural, observed: v as u64, signal: "method_klass_off" }); }
-                }
-                None => mk_ok = false,
-            }
-        }
-        // method_name_off
-        if mn_ok {
-            match mn {
-                Some(v) => {
-                    if let Some(prev) = mn_agreed { if v != prev { mn_ok = false; } }
-                    else { mn_agreed = Some(v); }
-                    if mn_ok { mn_witnesses.push(Witness { method: DerivationMethod::Structural, observed: v as u64, signal: "method_name_off" }); }
-                }
-                None => mn_ok = false,
-            }
-        }
+        let (p, k, n) = suboffsets::derive_method_suboffsets(mem, mi0, klass);
+        vote(&mut mp, p, "method_pointer_off");
+        vote(&mut mk, k, "method_klass_off");
+        vote(&mut mn, n, "method_name_off");
     }
 
-    let n = klasses.len() as u16;
-    let make = |ok: bool, agreed: Option<usize>, witnesses: Vec<Witness>| -> Fact<usize> {
-        if ok {
-            if let Some(v) = agreed {
-                return Fact::Resolved { value: v, provenance: Provenance { witnesses, sampled: n } };
-            }
+    let make = |slot: Slot| -> Fact<usize> {
+        let (agreed, witnesses, ok) = slot;
+        match agreed {
+            Some(v) if ok && witnesses.len() >= MIN_SAMPLES => Fact::Resolved {
+                value: v,
+                provenance: Provenance { sampled: witnesses.len() as u16, witnesses },
+            },
+            Some(_) => Fact::Unresolved { reason: UnresolvedReason::WitnessDisagreement },
+            None => Fact::Unresolved { reason: UnresolvedReason::NoWitness },
         }
-        Fact::Unresolved { reason: UnresolvedReason::WitnessDisagreement }
     };
 
-    (
-        make(mp_ok, mp_agreed, mp_witnesses),
-        make(mk_ok, mk_agreed, mk_witnesses),
-        make(mn_ok, mn_agreed, mn_witnesses),
-    )
+    (make(mp), make(mk), make(mn))
 }
 
 /// Walk `sampled_klasses` and try to read the class name at klass+0x10.
@@ -509,6 +493,47 @@ mod tests {
         if let Fact::Resolved { ref provenance, .. } = layout.method_pointer_off {
             assert!(provenance.sampled >= 12, "method_pointer_off sampled={}", provenance.sampled);
         }
+    }
+
+    #[test]
+    fn discover_skips_no_method_klasses_abstention() {
+        // Regression (live bug): klass-shaped klasses with NO methods array must
+        // ABSTAIN, not collapse the consensus. 3 empty klasses + 12 with methods.
+        let mut m = MockMem::new();
+        let code = 0x6f00_0000usize;
+        m.mark_exec(code, 0x1000);
+        let table_base = 0x100_0000usize;
+
+        // First 3: klass-shaped but NO methods/fields → recognize_methods abstains.
+        for i in 0..3usize {
+            let klass = 0x200_0000 + i * 0x20_000;
+            m.put_u64(table_base + i * 8, klass as u64);
+            let img = klass + 0x10_000;
+            let imgname = klass + 0x11_000;
+            let cname = klass + 0x12_000;
+            let ns = klass + 0x13_000;
+            m.put_u64(klass + 0x00, img as u64);
+            m.put_u64(img + 0x00, imgname as u64);
+            m.put_cstr(imgname, "Assembly-CSharp.dll");
+            m.put_u64(klass + 0x10, cname as u64);
+            m.put_cstr(cname, "Empty");
+            m.put_u64(klass + 0x18, ns as u64);
+            m.put_cstr(ns, "");
+        }
+        // Next 12: full klasses with methods@0x98.
+        for i in 3..15usize {
+            let klass = 0x200_0000 + i * 0x20_000;
+            m.put_u64(table_base + i * 8, klass as u64);
+            build_klass(&mut m, klass, "MyClass", code);
+        }
+
+        let layout = discover(&m, table_base, 15);
+        assert_eq!(
+            layout.klass_methods.require(),
+            Ok(0x98),
+            "abstaining klasses must not break methods consensus"
+        );
+        assert_eq!(layout.method_pointer_off.require(), Ok(0x0));
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! null static_fields) and type_def returns NoMetadata without metadata access.
 
 use crate::bedrock::{
+    discover::foundation::is_klass_shape,
     fact::{DerivationMethod, Fact, Provenance, UnresolvedReason, Witness},
     mem::MemView,
 };
@@ -36,12 +37,15 @@ pub fn discover_static_fields(
         for &klass in klasses {
             if let Some(slot) = mem.read_u64(klass + off) {
                 let addr = slot as usize;
-                if addr != 0 && addr >= 0x10_0000 && !mem.is_exec(addr) {
+                // Reject structural class-pointers (self / element_class / castClass /
+                // parent): those are non-null on every klass and would falsely win.
+                // A static-storage pointer points to a DATA block, not to a klass.
+                if addr != 0 && addr >= 0x10_0000 && !mem.is_exec(addr) && !is_klass_shape(mem, addr) {
                     hits += 1;
                     witnesses.push(Witness {
                         method: DerivationMethod::Structural,
                         observed: off as u64,
-                        signal: "non-exec data ptr at candidate offset",
+                        signal: "non-exec, non-klass data ptr at candidate offset",
                     });
                 }
             }
