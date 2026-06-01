@@ -16,3 +16,5 @@ mod internals;
 mod runtime;
 #[cfg(target_os = "windows")]
 mod diagnostics;
+#[cfg(target_os = "windows")]
+mod bedrock_glue;

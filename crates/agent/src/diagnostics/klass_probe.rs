@@ -20,7 +20,7 @@ use crate::paths::log;
 
 /// Page protection at `addr`, as a short tag. Lets us spot `static_fields`
 /// (points into a RW data region) vs code (RX) vs metadata (RO).
-fn protect_of(addr: usize) -> &'static str {
+pub(crate) fn protect_of(addr: usize) -> &'static str {
     unsafe {
         let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         if VirtualQuery(addr as *const c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {

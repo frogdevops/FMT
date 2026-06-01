@@ -203,6 +203,9 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     if std::env::var("FROG_RECOGNIZER_PROBE").is_ok() {
         crate::diagnostics::klass_probe::run_recognizer_probe(&map, table_base, table_count);
     }
+    if std::env::var("FROG_LAYOUT_PROBE").is_ok() {
+        crate::bedrock_glue::run_layout_probe(&map, table_base, table_count);
+    }
 
     // B-6a: ensure scripts/ folder exists, perform initial load if a script
     // is already present at startup, then spawn the watcher.
