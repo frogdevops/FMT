@@ -311,7 +311,12 @@ fn host_field_info(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, nam
     let name = String::from_utf8_lossy(&name);
     let klass = agent_core::spine::KlassPtr::from_raw(klass as u64);
     match crate::internals::api::field_info(klass, &name) {
-        Some((offset, vt)) => ((vt as u8 as i64) << 32) | (offset as i64),
+        Some((offset, vt, is_static)) => {
+            let mut packed: i64 = offset as i64;          // bits 0-31
+            packed |= (vt as u8 as i64) << 32;            // bits 32-39
+            if is_static { packed |= 1i64 << 40; }        // bit 40
+            packed
+        }
         None => -1,
     }
 }
@@ -359,6 +364,34 @@ fn host_find_method(caller: Caller<'_, HostState>, klass: i64, name_ptr: i32, na
     crate::internals::api::find_method(klass, &String::from_utf8_lossy(&name), argc.max(0) as u32)
         .map(|m| m.as_u64() as i64)
         .unwrap_or(0)
+}
+
+/// List methods of `klass` into the guest buffer. 8 bytes/entry (MethodPtr LE u64).
+/// Returns count written, or a negative status code on error.
+fn host_list_methods(mut caller: Caller<'_, HostState>, klass: i64, out_buf: i32, out_cap_count: i32) -> i32 {
+    let klass = agent_core::spine::KlassPtr::from_raw(klass as u64);
+    let methods = crate::internals::api::methods_of(klass);
+    let take = methods.len().min(out_cap_count.max(0) as usize);
+    let mut buf = Vec::with_capacity(take * 8);
+    for m in methods.iter().take(take) {
+        buf.extend_from_slice(&m.as_u64().to_le_bytes());
+    }
+    if !write_guest(&mut caller, out_buf, &buf) { return status::ERR_BUF_TOO_SMALL; }
+    take as i32
+}
+
+/// List live instances of `klass` into the guest buffer. 8 bytes/entry (Instance addr LE u64).
+/// Returns count written, or negative status. First call per klass triggers an AOB scan (cached).
+fn host_list_instances(mut caller: Caller<'_, HostState>, klass: i64, out_buf: i32, out_cap_count: i32) -> i32 {
+    let klass = agent_core::spine::KlassPtr::from_raw(klass as u64);
+    let max = out_cap_count.max(0) as usize;
+    let instances = crate::internals::api::instances_of(klass, max);
+    let mut buf = Vec::with_capacity(instances.len() * 8);
+    for i in &instances {
+        buf.extend_from_slice(&i.as_u64().to_le_bytes());
+    }
+    if !write_guest(&mut caller, out_buf, &buf) { return status::ERR_BUF_TOO_SMALL; }
+    instances.len() as i32
 }
 
 fn host_install_hook(
@@ -503,7 +536,9 @@ pub fn run_wasm_with_mem(wasm_bytes: &[u8]) -> Result<Vec<String>, WasmError> {
     linker.func_wrap("il2cpp", "get_field", host_get_field).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "klass_of", host_klass_of).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "static_field", host_static_field).map_err(|e| WasmError::Instantiate(e.to_string()))?;
-    linker.func_wrap("il2cpp", "find_method", host_find_method).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "find_method",    host_find_method).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "list_methods",   host_list_methods).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+    linker.func_wrap("il2cpp", "list_instances", host_list_instances).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "invoke", host_invoke).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "install_hook", host_install_hook).map_err(|e| WasmError::Instantiate(e.to_string()))?;
     linker.func_wrap("il2cpp", "remove_hook", host_remove_hook).map_err(|e| WasmError::Instantiate(e.to_string()))?;

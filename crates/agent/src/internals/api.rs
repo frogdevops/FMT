@@ -90,13 +90,18 @@ fn type_tc(type_ptr: usize) -> u8 {
     ((chunk >> c.cfg.discrim_shift) & 0xFF) as u8
 }
 
-/// Field offset + external ValType for `name`, or None. The composition bridge.
-pub fn field_info(klass: KlassPtr, name: &str) -> Option<(u32, ValType)> {
+/// Field offset + external ValType + is_static for `name`, or None. The composition bridge.
+pub fn field_info(klass: KlassPtr, name: &str) -> Option<(u32, ValType, bool)> {
+    let c = ctx::get()?;
     let mut found = None;
     for_each_field(klass.as_u64() as usize, |fname, offset, type_ptr| {
         if fname == name {
             let vt = valtype_from_tc(type_tc(type_ptr)).unwrap_or(ValType::U64);
-            found = Some((offset, vt));
+            // FIELD_ATTRIBUTE_STATIC (0x10) lives in the low byte of the same chunk
+            // that type_tc reads — same source, same offset, matching fields_at/static_field.
+            let chunk = cache::read_u64(type_ptr + c.cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
+            let is_static = (chunk & 0x10) != 0;
+            found = Some((offset, vt, is_static));
             true
         } else {
             false
@@ -107,7 +112,7 @@ pub fn field_info(klass: KlassPtr, name: &str) -> Option<(u32, ValType)> {
 
 /// Read a field by name through external's validated read. The native read.
 pub fn get_field(instance: Instance, klass: KlassPtr, name: &str) -> Result<Value, i32> {
-    let (offset, vt) = field_info(klass, name).ok_or(status::ERR_BAD_TYPE)?;
+    let (offset, vt, _is_static) = field_info(klass, name).ok_or(status::ERR_BAD_TYPE)?;
     let addr_raw = (instance.as_u64() as usize).wrapping_add(offset as usize) as u64;
     let addr = MemAddr::<ReadOnly>::from_raw(addr_raw);
     let val = match vt {
@@ -164,8 +169,6 @@ pub fn static_field(klass: KlassPtr, name: &str) -> Option<MemAddr<ReadWrite>> {
 }
 
 /// Enumerate all methods of `klass`. Composes `Iter<MethodPtr> for KlassPtr`.
-#[allow(dead_code)]
-// Wired by Task 9 (host_list_methods)
 pub fn methods_of(klass: KlassPtr) -> Vec<MethodPtr> {
     use agent_core::spine::Iter;
     <KlassPtr as Iter<MethodPtr>>::iter(&klass).collect()
@@ -174,8 +177,6 @@ pub fn methods_of(klass: KlassPtr) -> Vec<MethodPtr> {
 /// Enumerate live instances of `klass` via the registered scan_backend, capped
 /// at `max` candidates. Each yielded Instance is structurally validated inside
 /// the iterator (alignment / klass_of / klass-shape), so results are real.
-#[allow(dead_code)]
-// Wired by Task 10 (host_list_instances)
 pub fn instances_of(klass: KlassPtr, max: usize) -> Vec<Instance> {
     use agent_core::spine::Iter;
     <KlassPtr as Iter<Instance>>::iter(&klass).take(max).collect()
@@ -245,7 +246,7 @@ pub fn field_addr(
     name: &str,
     instance: Instance,
 ) -> Option<FieldAddr> {
-    let (offset, vt) = field_info(klass, name)?;
+    let (offset, vt, _is_static) = field_info(klass, name)?;
     let addr_raw = (instance.as_u64() as usize).wrapping_add(offset as usize) as u64;
     // SAFETY: caller obtained `instance` via the spine API; instance fields
     // are writable by their semantic role.
