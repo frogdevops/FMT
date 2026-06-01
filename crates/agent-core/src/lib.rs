@@ -1,3 +1,4 @@
+pub mod bedrock;
 pub mod calibration;
 pub mod logfile;
 pub mod mem_value;
