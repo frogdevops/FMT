@@ -25,7 +25,7 @@ pub type NextMatchFn = fn(target_klass: usize, cursor: &mut usize) -> Option<usi
 
 /// Structural validation: returns `true` iff `addr` passes ALL of these
 /// universal checks (no per-klass branching):
-///   1. address is in a writable memory region
+///   1. address is in a readable (committed + mapped) memory region
 ///   2. address is aligned to pointer size (8 on x86_64)
 ///   3. `klass_of(addr) == target_klass`
 ///   4. the klass at `addr+0` passes `is_klass_shape` (name + namespace

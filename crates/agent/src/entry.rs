@@ -181,6 +181,11 @@ extern "system" fn worker(_param: *mut c_void) -> u32 {
     // agent-side walk logic. Must follow `ctx::init` — the shims read it.
     crate::internals::api::register_metadata_backend();
 
+    // B-6b: register the scan-backend for Iter<Instance>. Must follow
+    // register_mem_backend (validation reads the region cache) and
+    // register_metadata_backend (klass_of via cache::read_u64).
+    crate::internals::api::register_scan_backend();
+
     // Klass probe must run AFTER ctx::init() so find_class() has a valid context.
     if std::env::var("FROG_KLASS_PROBE").is_ok() {
         crate::diagnostics::klass_probe::run_klass_probe();
