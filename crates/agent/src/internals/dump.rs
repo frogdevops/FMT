@@ -46,10 +46,14 @@ fn format_class(c: &DumpedClass, fields: &[String]) -> Vec<String> {
     out
 }
 
+/// Maximum FieldInfo slots the per-class field walk inspects. When a walk hits
+/// this cap, the dump emits an honesty signal (some fields may be missing).
+const MAX_FIELDS_PER_CLASS: usize = 256;
+
 /// Render a single field line. `type_name` may be empty for un-resolvable
 /// metadata-only fields — we print `<?>` so the user sees the hole instead of
 /// silently dropping the field.
-fn field_line(name: &str, type_name: &str, offset: u32, token: u32) -> String {
+fn field_line(name: &str, type_name: &str, offset: u32, token: u32, is_static: bool) -> String {
     // il2cpp uses 0xffffffff as the "field exists in metadata but runtime
     // offset not computed" sentinel (e.g. thread_local_static_fields_index).
     // Display as META so modders see intent rather than what looks like garbage.
@@ -58,10 +62,13 @@ fn field_line(name: &str, type_name: &str, offset: u32, token: u32) -> String {
     } else {
         format!("{:#x}", offset)
     };
+    // `static ` prefix iff FIELD_ATTRIBUTE_STATIC; driven by the same `chunk & 0x10`
+    // bit the rest of the codebase uses (fields_at / static_field).
+    let stat = if is_static { "static " } else { "" };
     if type_name.is_empty() {
-        format!("    {}: <?> // Offset: {}, Token: {:#x}", name, offset_str, token)
+        format!("    {}{}: <?> // Offset: {}, Token: {:#x}", stat, name, offset_str, token)
     } else {
-        format!("    {}: {} // Offset: {}, Token: {:#x}", name, type_name, offset_str, token)
+        format!("    {}{}: {} // Offset: {}, Token: {:#x}", stat, name, type_name, offset_str, token)
     }
 }
 
@@ -173,9 +180,22 @@ pub fn build_internals_lines(
         }
         let key = (cns.clone(), cname.clone());
 
-        let rt_fields = collect_runtime_fields(cls, api, cfg, map, type_maps);
+        let (rt_fields, cap_hit) = collect_runtime_fields(cls, api, cfg, map, type_maps);
         runtime_field_count += rt_fields.len();
         seen_in_runtime.insert(key.clone());
+        // Honesty signal: the field walk capped out, so some fields may be missing.
+        let cap_note = if cap_hit {
+            Some(format!(
+                "    // ⚠ field walk hit MAX cap ({}); some fields may be missing",
+                MAX_FIELDS_PER_CLASS
+            ))
+        } else {
+            None
+        };
+
+        // Collect method and instance lines once — appended after fields in both paths.
+        let method_lines   = collect_runtime_methods(cls as usize);
+        let instance_lines = collect_runtime_instances(cls as usize);
 
         // Type-from-index helper used during the metadata merge.
         let type_from_idx = |type_idx: u32| -> String {
@@ -205,15 +225,15 @@ pub fn build_internals_lines(
         if let (Some(idx), Some(mr)) = (meta_index.as_ref(), metadata_result) {
             if let Some(&ci) = idx.get(&key) {
                 let meta_class = &mr.dump.classes[ci];
-                let rt_lookup: HashMap<&str, (String, u32, u32)> = rt_fields
+                let rt_lookup: HashMap<&str, (&str, u32, u32, bool)> = rt_fields
                     .iter()
-                    .map(|(n, t, o, tk)| (n.as_str(), (t.clone(), *o, *tk)))
+                    .map(|f| (f.name.as_str(), (f.type_name.as_str(), f.offset, f.token, f.is_static)))
                     .collect();
                 let mut fields: Vec<String> = Vec::new();
                 for mf in &meta_class.fields {
-                    let (tn, off, tk) = rt_lookup
+                    let (tn, off, tk, is_static) = rt_lookup
                         .get(mf.name.as_str())
-                        .map(|(t, o, tk)| {
+                        .map(|(t, o, tk, st)| {
                             let resolved_type = mf
                                 .type_index
                                 .and_then(|ti| {
@@ -224,22 +244,30 @@ pub fn build_internals_lines(
                                         Some(r)
                                     }
                                 })
-                                .unwrap_or_else(|| t.clone());
-                            (resolved_type, *o, *tk)
+                                .unwrap_or_else(|| t.to_string());
+                            (resolved_type, *o, *tk, *st)
                         })
-                        .unwrap_or_else(|| ("<?>".to_string(), 0, 0));
-                    fields.push(field_line(&mf.name, &tn, off, tk));
+                        .unwrap_or_else(|| ("<?>".to_string(), 0, 0, false));
+                    fields.push(field_line(&mf.name, &tn, off, tk, is_static));
+                }
+                if let Some(note) = &cap_note {
+                    fields.push(note.clone());
                 }
                 all_lines.extend(format_class(meta_class, &fields));
+                all_lines.extend(method_lines.iter().cloned());
+                all_lines.extend(instance_lines.iter().cloned());
                 continue;
             }
         }
 
         // No metadata match — emit whatever the runtime walk found.
-        if !rt_fields.is_empty() {
+        if !rt_fields.is_empty() || !method_lines.is_empty() || !instance_lines.is_empty() {
             let mut fields: Vec<String> = Vec::new();
-            for (fn_, ft, off, tk) in &rt_fields {
-                fields.push(field_line(fn_, ft, *off, *tk));
+            for f in &rt_fields {
+                fields.push(field_line(&f.name, &f.type_name, f.offset, f.token, f.is_static));
+            }
+            if let Some(note) = &cap_note {
+                fields.push(note.clone());
             }
             let full = if cns.is_empty() {
                 cname
@@ -248,6 +276,8 @@ pub fn build_internals_lines(
             };
             all_lines.push(format!("{} ({} fields):", full, fields.len()));
             all_lines.extend(fields);
+            all_lines.extend(method_lines);
+            all_lines.extend(instance_lines);
         }
     }
 
@@ -289,7 +319,10 @@ pub fn build_internals_lines(
                                 })
                             })
                             .unwrap_or_else(|| "<?>".to_string());
-                        field_line(&f.name, &tn, 0, 0)
+                        // metadata-only class: not loaded into the runtime, so there
+                        // is no live Il2CppType* to read the static bit from. We do
+                        // not fabricate a `static ` marker we can't verify.
+                        field_line(&f.name, &tn, 0, 0, false)
                     })
                     .collect();
                 all_lines.extend(format_class(c, &fields));
@@ -329,16 +362,47 @@ fn read_generic_context(cls: usize, map: &RegionMap, cfg: &Il2CppConfig) -> Opti
     if args.is_empty() { None } else { Some(GenericCtx { args }) }
 }
 
+/// One live field collected from a class. The `is_static` bit is derived from
+/// `chunk & 0x10` read at `type_ptr + il2cpp_type_discrim_read_at` — the SAME
+/// source/offset/mask that `fields_at` and `static_field` use in api.rs, so the
+/// dump's `static ` marker agrees with the rest of the runtime.
+struct RtField {
+    name: String,
+    type_name: String,
+    offset: u32,
+    token: u32,
+    is_static: bool,
+}
+
+/// Read the FIELD_ATTRIBUTE_STATIC bit for a field whose `Il2CppType*` is
+/// `type_ptr`. Mirrors api.rs `fields_at`/`static_field` exactly.
+fn read_field_is_static(type_ptr: usize, cfg: &Il2CppConfig, map: &RegionMap) -> bool {
+    if type_ptr == 0 {
+        return false;
+    }
+    let chunk = map.read_u64(type_ptr + cfg.il2cpp_type_discrim_read_at).unwrap_or(0);
+    (chunk & 0x10) != 0
+}
+
+/// Collect a class's live fields plus a flag indicating the field-walk cap was
+/// hit (so the caller can emit an honesty signal). DECISION (Task 11): this keeps
+/// the dumper's OWN two-path walk — FFI `class_get_fields` first, then the
+/// `klass->fields` memory-walk fallback — rather than switching to
+/// `Iter<FieldInfo>`/`for_each_field`. The spine iterator is backed by
+/// `fields_at`, which is memory-walk ONLY (no FFI path) and reads via the global
+/// `cache`/`ctx` instead of the dumper's `RegionMap`. Switching to it would drop
+/// the FFI walk and change the read backend at dump time = canary blindness.
+/// This walk is the strictly-more-complete one, so it stays.
 fn collect_runtime_fields(
     cls: *mut c_void,
     api: &Il2CppApi,
     cfg: &Il2CppConfig,
     map: &RegionMap,
     type_maps: &TypeMaps,
-) -> Vec<(String, String, u32, u32)> {
-    const MAX_FIELDS_PER_CLASS: usize = 256;
+) -> (Vec<RtField>, bool) {
     let ctx = read_generic_context(cls as usize, map, cfg);
-    let mut rt_fields: Vec<(String, String, u32, u32)> = Vec::new();
+    let mut rt_fields: Vec<RtField> = Vec::new();
+    let mut cap_hit = false;
     if let Some(get_fields) = api.class_get_fields {
         // FFI iterator (preferred — uses the runtime's own enumeration).
         let mut iter: *mut c_void = std::ptr::null_mut();
@@ -348,6 +412,7 @@ fn collect_runtime_fields(
                 break;
             }
             if rt_fields.len() >= MAX_FIELDS_PER_CLASS {
+                cap_hit = true;
                 break;
             }
             let fname = unsafe { cstr_to_string((api.field_get_name)(f)) };
@@ -365,7 +430,8 @@ fn collect_runtime_fields(
             };
             let token = map.read_u32(f as usize + 28).unwrap_or(0);
             if token == 0 { continue; }   // scanner garbage: real fields always have a metadata token
-            rt_fields.push((fname, ftype, offset, token));
+            let is_static = read_field_is_static(ftype_ptr as usize, cfg, map);
+            rt_fields.push(RtField { name: fname, type_name: ftype, offset, token, is_static });
         }
     } else {
         // Memory-walk fallback.  klass->fields is at `cfg.klass_fields` offset.
@@ -382,6 +448,11 @@ fn collect_runtime_fields(
                 let name_ptr = map.read_u64(f).unwrap_or(0) as usize;
                 if name_ptr == 0 {
                     break;
+                }
+                // The cap truncated the walk while a real slot was still present
+                // (no null sentinel reached): some fields may be missing.
+                if fi == MAX_FIELDS_PER_CLASS - 1 {
+                    cap_hit = true;
                 }
                 let fname = match map.read_name(name_ptr) {
                     Some(n) => n,
@@ -408,9 +479,81 @@ fn collect_runtime_fields(
                 } else {
                     raw_offset
                 };
-                rt_fields.push((fname, ftype, offset, token));
+                // FIELD_ATTRIBUTE_STATIC (0x10) lives in the low byte of the same
+                // `chunk` read above — identical source/offset/mask to fields_at.
+                let is_static = (chunk & 0x10) != 0;
+                rt_fields.push(RtField { name: fname, type_name: ftype, offset, token, is_static });
             }
         }
     }
-    rt_fields
+    (rt_fields, cap_hit)
+}
+
+/// Collect formatted method lines for one class. Mirrors the read pattern of
+/// `find_method` in api.rs exactly: `ctx::get()` + `cache::read_u64/read_u8/
+/// read_cstr` with `cfg.method_name_off` and `cfg.method_param_count_off`.
+/// Returns an empty Vec when the class has no methods or ctx is not live.
+///
+/// HONESTY SIGNAL: when the returned count equals `MAX_METHODS_PER_CLASS` the
+/// `Iter<MethodPtr>` may have capped early — we emit a warning line so the
+/// reader knows the list may be truncated.
+fn collect_runtime_methods(cls: usize) -> Vec<String> {
+    use agent_core::spine::KlassPtr;
+    let klass = KlassPtr::from_raw(cls as u64);
+    let methods = crate::internals::api::methods_of(klass);
+    let count = methods.len();
+    let mut lines = Vec::new();
+    if count == 0 {
+        return lines;
+    }
+    lines.push(format!("    methods ({}):", count));
+    for m in &methods {
+        let mi = m.as_u64() as usize;
+        let (name, argc) = match crate::internals::ctx::get() {
+            Some(c) => {
+                let name_ptr = crate::external::cache::read_u64(mi + c.cfg.method_name_off)
+                    .unwrap_or(0) as usize;
+                let name = crate::external::cache::read_cstr(name_ptr)
+                    .unwrap_or_else(|| "?".into());
+                let argc = crate::external::cache::read_u8(mi + c.cfg.method_param_count_off)
+                    .unwrap_or(0);
+                (name, argc)
+            }
+            None => ("?".into(), 0u8),
+        };
+        lines.push(format!("        {}({} args)", name, argc));
+    }
+    // When the iterator returned exactly the cap the walk may have been cut short.
+    if count == agent_core::spine::access::MAX_METHODS_PER_CLASS {
+        lines.push("        // ⚠ method walk hit MAX cap; some methods may be missing".to_string());
+    }
+    lines
+}
+
+/// Collect formatted live-instance lines for one class. Asks `instances_of`
+/// for DISPLAY_CAP+1 so we can distinguish "exactly 10" from "10 or more".
+/// Returns an empty Vec when no live instances exist — the section is omitted
+/// entirely so classes with zero instances don't clutter the dump.
+///
+/// SCAN COST NOTE: `instances_of` triggers an AOB scan on first call per klass
+/// (results are cached). Over a large class table (thousands of classes) the
+/// aggregate scan cost is non-trivial, but the dump runs off the hot path so
+/// this is acceptable. The scan does NOT block the game thread.
+fn collect_runtime_instances(cls: usize) -> Vec<String> {
+    use agent_core::spine::KlassPtr;
+    let klass = KlassPtr::from_raw(cls as u64);
+    const DISPLAY_CAP: usize = 10;
+    // Request one extra so we can tell whether there are more than DISPLAY_CAP.
+    let instances = crate::internals::api::instances_of(klass, DISPLAY_CAP + 1);
+    let mut lines = Vec::new();
+    if instances.is_empty() {
+        return lines;
+    }
+    let shown  = instances.len().min(DISPLAY_CAP);
+    let suffix = if instances.len() > DISPLAY_CAP { " (10+ shown)" } else { "" };
+    lines.push(format!("    live instances ({}){}", shown, suffix));
+    for inst in instances.iter().take(DISPLAY_CAP) {
+        lines.push(format!("        {:#x}", inst.as_u64()));
+    }
+    lines
 }

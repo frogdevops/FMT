@@ -28,8 +28,9 @@ use crate::spine::{mem_backend, metadata_backend};
 const MAX_FIELDS_PER_CLASS: usize = 256;
 
 /// Defensive cap: real il2cpp classes never have this many methods. Mirrors
-/// the `find_method` cap in `agent::internals::api`.
-const MAX_METHODS_PER_CLASS: usize = 4096;
+/// the `find_method` cap in `agent::internals::api`. Exposed `pub` so the
+/// dumper can reference the same value when emitting its honesty signal.
+pub const MAX_METHODS_PER_CLASS: usize = 4096;
 
 /// Read a typed value of `T` from this handle.
 pub trait Read<T: MemValue> {
